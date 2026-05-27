@@ -31,7 +31,7 @@ from games.foxlite import (
 
 
 def _choose_action(net: PolicyValueNet, state: dict, rng: random.Random) -> dict:
-    counts, _ = aggregate_visit_counts(
+    counts, _, _ = aggregate_visit_counts(
         state, net_evaluator(net),
         num_determinizations=config.NUM_DETERMINIZATIONS,
         num_simulations=config.NUM_SIMULATIONS,

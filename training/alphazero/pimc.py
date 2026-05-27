@@ -160,13 +160,15 @@ def aggregate_visit_counts(
     dirichlet_alpha: float = 0.5,
     dirichlet_epsilon: float = 0.25,
     rng: Optional[random.Random] = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Run PIMC and return (counts[NUM_CARDS], q_values[NUM_CARDS]).
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Run PIMC and return (counts[NUM_CARDS], q_values[NUM_CARDS], root_q).
 
     `state` is from the mover's seat (its own hand is `state[mover-hand]`).
     `evaluator` is called with perfect-info world states inside each rollout.
     Counts and Q-values cover the full 33-card action space; non-legal /
-    non-explored actions are 0.
+    non-explored actions are 0. `root_q` is the visit-weighted root value
+    averaged across all determinizations — a low-variance estimate of the
+    position's value in the mover's frame, suitable as a value-head target.
     """
     rng = rng or random.Random()
     mover = state["awaiting"]
@@ -174,6 +176,8 @@ def aggregate_visit_counts(
 
     counts = np.zeros(NUM_CARDS, dtype=np.float64)
     q_sums = np.zeros(NUM_CARDS, dtype=np.float64)
+    root_value_sum = 0.0
+    root_visits_sum = 0
     for _ in range(num_determinizations):
         det = sample_determinization(infoset, rng) if mover == BOT \
             else _sample_human_determinization(state, rng)
@@ -186,6 +190,8 @@ def aggregate_visit_counts(
             dirichlet_epsilon=dirichlet_epsilon,
             rng=rng,
         )
+        root_value_sum += root.value_sum
+        root_visits_sum += root.visit_count
         for action, child in root.children.items():
             counts[action] += child.visit_count
             q_sums[action] += child.visit_count * child.mean_value()
@@ -193,7 +199,8 @@ def aggregate_visit_counts(
     q_values = np.zeros(NUM_CARDS, dtype=np.float64)
     nz = counts > 0
     q_values[nz] = q_sums[nz] / counts[nz]
-    return counts, q_values
+    root_q = root_value_sum / root_visits_sum if root_visits_sum > 0 else 0.0
+    return counts, q_values, root_q
 
 
 # In self-play the *human* seat also makes decisions; symmetry with the bot.
@@ -265,4 +272,27 @@ def uniform_rollout_evaluator(rng: Optional[random.Random] = None) -> Evaluator:
     def evaluator(state: dict, mover: str) -> tuple[list[float], float]:
         priors = [1.0 / NUM_CARDS] * NUM_CARDS  # PIMC re-normalizes over legal
         return priors, rollout_value(state, mover, rng)
+    return evaluator
+
+
+def hybrid_evaluator(net, rng: Optional[random.Random] = None) -> Evaluator:
+    """Self-play training evaluator: NET policy + ROLLOUT value at leaves.
+
+    Breaks the value head's self-bootstrapping during training — leaf values
+    come from grounded rollouts, not the network's own predictions. The
+    policy head still steers the search via priors, so MCTS visit counts and
+    the resulting policy targets carry the policy head's current beliefs.
+
+    Inference (deployed engine) uses pure `net_evaluator` — rollouts at
+    leaves would be too slow at PIMC's play-time budget.
+    """
+    rng = rng or random.Random()
+    # Local imports keep pimc.py importable without dragging alphazero.network
+    # into modules that just use the search.
+    from alphazero.network import infer
+    from games.foxlite import encode, rollout_value
+
+    def evaluator(state: dict, mover: str) -> tuple[list[float], float]:
+        logits, _ = infer(net, encode(state, mover))
+        return logits, rollout_value(state, mover, rng)
     return evaluator

@@ -22,7 +22,7 @@ import torch
 
 import config
 from alphazero.network import PolicyValueNet, infer
-from alphazero.pimc import Evaluator, aggregate_visit_counts
+from alphazero.pimc import Evaluator, aggregate_visit_counts, hybrid_evaluator
 from games.foxlite import (
     BOT,
     CARDS_BY_INDEX,
@@ -41,7 +41,10 @@ from games.foxlite import (
 
 
 def net_evaluator(net: PolicyValueNet) -> Evaluator:
-    """Wrap a network into the PIMC evaluator interface."""
+    """Pure-net evaluator — used at INFERENCE time only. Self-play training
+    uses `alphazero.pimc.hybrid_evaluator` (net policy + rollout value) so
+    the value head doesn't bootstrap from its own predictions.
+    """
     def evaluator(state: dict, mover: str) -> tuple[list[float], float]:
         x = encode(state, mover)
         logits, value = infer(net, x)
@@ -53,15 +56,16 @@ def play_one_round(
     net: PolicyValueNet,
     state: dict,
     rng: random.Random,
-) -> tuple[dict, list[tuple[list[float], np.ndarray, str]]]:
+) -> tuple[dict, list[tuple[list[float], np.ndarray, str, float]]]:
     """Play one round from `state` to round-over, recording each decision.
 
     Returns (final_state, decisions). Each decision is
-    (encoded_input, policy_target, mover). Value targets are filled in after
-    the round ends (by the caller, who has access to the final state).
+    `(encoded_input, policy_target, mover, root_q)` — the value target is
+    the MCTS root-Q at that decision (averaged across determinizations,
+    grounded in rollouts since the search used the hybrid evaluator).
     """
-    evaluator = net_evaluator(net)
-    decisions: list[tuple[list[float], np.ndarray, str]] = []
+    evaluator = hybrid_evaluator(net, rng=rng)
+    decisions: list[tuple[list[float], np.ndarray, str, float]] = []
 
     while state["phase"] not in ("round-over", "match-over"):
         if state["phase"] == "trick-complete":
@@ -70,7 +74,7 @@ def play_one_round(
         # phase == 'playing'
         mover = state["awaiting"]
         x = encode(state, mover)
-        counts, _ = aggregate_visit_counts(
+        counts, _, root_q = aggregate_visit_counts(
             state, evaluator,
             num_determinizations=config.NUM_DETERMINIZATIONS,
             num_simulations=config.NUM_SIMULATIONS,
@@ -84,7 +88,7 @@ def play_one_round(
         # Policy target: visit-count proportions over the full 33-card space.
         total = counts.sum()
         policy = counts / total if total > 0 else _uniform_legal(state)
-        decisions.append((x, policy, mover))
+        decisions.append((x, policy, mover, float(root_q)))
 
         # Move selection: temperature 1 for the first N plies of the round,
         # argmax thereafter. Plies are counted from trick 1 — easy proxy.
@@ -123,22 +127,21 @@ def play_one_match(
     rng: random.Random,
     max_rounds: int = 30,
 ) -> list[tuple[list[float], np.ndarray, float]]:
-    """Play one full match (to TARGET_SCORE or `max_rounds` rounds), returning
-    every decision tuple `(input, policy, value)` ready for the replay buffer.
+    """Play one full match, returning `(input, policy, value)` records.
+
+    Value target = MCTS root-Q at the decision (already in mover's frame).
+    Much lower variance than the eventual round outcome because it averages
+    256 rollouts (NUM_DETERMINIZATIONS x NUM_SIMULATIONS) of the actual
+    sub-game from that position, instead of inheriting one noisy round
+    outcome across 26 decisions.
     """
     state = create_game(rng=rng)
     all_records: list[tuple[list[float], np.ndarray, float]] = []
     rounds = 0
     while state["phase"] != "match-over" and rounds < max_rounds:
         final, decisions = play_one_round(net, state, rng)
-        # signed margin from BOT's frame for THIS round only.
-        bot_pts = score_for_tricks(final["tricksWon"]["bot"])
-        human_pts = score_for_tricks(final["tricksWon"]["human"])
-        margin_bot_frame = (bot_pts - human_pts) / 6.0
-        for x, policy, mover in decisions:
-            value = margin_bot_frame if mover == BOT else -margin_bot_frame
-            all_records.append((x, policy, value))
-        # Advance: end_round seeds the next round (or ends match).
+        for x, policy, _mover, root_q in decisions:
+            all_records.append((x, policy, root_q))
         state = end_round(final, rng=rng)
         rounds += 1
     return all_records
