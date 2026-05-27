@@ -5,9 +5,9 @@
   --text: #18181b;
   --muted: #71717a;
   --highlight: #fef9c3;
-  --suit-bells: #e67e00;
-  --suit-keys: #8a8a8a;
-  --suit-moons: #8a4fcf;
+  --suit-bells: #ff8c00;
+  --suit-keys: #c0c0c0;
+  --suit-moons: #800080;
 }
 
 * {
@@ -137,6 +137,21 @@ h1 {
 }
 
 .suit-moons {
+  color: var(--suit-moons);
+}
+
+.card--suit-bells {
+  border-color: var(--suit-bells);
+  color: var(--suit-bells);
+}
+
+.card--suit-keys {
+  border-color: var(--suit-keys);
+  color: var(--suit-keys);
+}
+
+.card--suit-moons {
+  border-color: var(--suit-moons);
   color: var(--suit-moons);
 }
 
