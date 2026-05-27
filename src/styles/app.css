@@ -140,21 +140,6 @@ h1 {
   color: var(--suit-moons);
 }
 
-.card--suit-bells {
-  border-color: var(--suit-bells);
-  color: var(--suit-bells);
-}
-
-.card--suit-keys {
-  border-color: var(--suit-keys);
-  color: var(--suit-keys);
-}
-
-.card--suit-moons {
-  border-color: var(--suit-moons);
-  color: var(--suit-moons);
-}
-
 .card--face-down {
   background: repeating-linear-gradient(
       45deg,
