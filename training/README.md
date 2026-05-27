@@ -32,8 +32,40 @@ python -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_
 
 ## Workflow
 
-*Filled in as each phase lands.* See the project's plan at
-`~/.claude/plans/swirling-whistling-river.md` for the phase roadmap.
+All commands assume the venv is active and are run from this `training/`
+directory.
+
+```sh
+python scripts/run_training.py                  # self-play -> train -> arena, looped
+python scripts/run_training.py --iterations 2 --games-per-iter 4   # smoke test
+python scripts/export_weights.py                # best.pt -> ../src/engine/weights.json
+node   scripts/headtohead.mjs ENGINE_A ENGINE_B 20   # match harness for any two engines
+```
+
+`run_training.py` writes `checkpoints/{best,latest}.pt`. Best is replaced
+only when a challenger wins ≥55% of arena matches against the prior best,
+which filters out the occasional silent regression characteristic of
+AlphaZero loops.
+
+### Layout
+
+| Path | Role |
+| --- | --- |
+| `games/foxlite.py` | rules port + the search-side glue (determinization, world helpers, 183-dim encoder) |
+| `alphazero/network.py` | small policy/value MLP (`PolicyValueNet`) |
+| `alphazero/pimc.py` | PUCT MCTS + the PIMC ensemble — symmetric, runs from either seat |
+| `alphazero/selfplay.py` | one self-play match → `(input, policy, value)` records |
+| `alphazero/replay_buffer.py` | FIFO buffer |
+| `alphazero/train.py` | masked-CE policy loss + MSE value loss, NaN guard + weight-norm tripwire |
+| `alphazero/arena.py` | head-to-head promotion gate at 55% |
+| `config.py` | every tunable |
+| `scripts/run_training.py` | end-to-end loop |
+| `scripts/export_weights.py` | checkpoint → JSON for the browser |
+
+`alphazero/inference_server.py` (batched GPU evaluation across parallel
+self-play workers) is in the plan but not yet implemented; current
+training is single-process. See `~/.claude/plans/swirling-whistling-river.md`
+for the phase roadmap.
 
 ### Parity with the browser engine
 
@@ -52,3 +84,11 @@ checked against the JS reference. Round transitions adopt the JS-side shuffle
 (we deliberately do not try to share an RNG between languages).
 
 The corpus file (`training/parity_expected.json`) is generated, not committed.
+
+For the network itself, a second pair of scripts runs the forward pass in
+float64 on both sides and asserts agreement to ~1e-9 (observed: ~1e-14):
+
+```sh
+python scripts/network_parity_dump.py     # Python forward on fixed inputs
+node   scripts/network_parity_check.mjs   # JS forward, compare
+```
