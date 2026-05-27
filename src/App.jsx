@@ -5,7 +5,7 @@ import RoundBanner from './components/RoundBanner.jsx'
 import Status from './components/Status.jsx'
 import Trick from './components/Trick.jsx'
 import Trump from './components/Trump.jsx'
-import { bestMove } from './engine/random.js'
+import { bestMove } from './engine/neural.js'
 import {
   BOT,
   HUMAN,
