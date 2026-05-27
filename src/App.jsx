@@ -98,7 +98,7 @@ export default function App() {
 
   return (
     <main className="app">
-      <h1>Fox in the Forest <span className="app__sub">Lite</span></h1>
+      <h1>Fox Lite</h1>
 
       <Status
         message={statusMessage(state)}

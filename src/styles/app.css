@@ -41,13 +41,6 @@ h1 {
   letter-spacing: -0.02em;
 }
 
-.app__sub {
-  font-weight: 500;
-  color: var(--muted);
-  font-size: 1.1rem;
-  margin-left: 0.4rem;
-}
-
 /* status block */
 
 .status {
