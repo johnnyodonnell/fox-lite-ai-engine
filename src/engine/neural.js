@@ -2,17 +2,12 @@
 //
 //   bestMove(state) -> a card from state.botHand
 //
-// CURRENT: PIMC search with a uniform policy prior + uniform-random rollouts
-// to round-end as the leaf value estimate. The training pipeline
-// (training/alphazero/) is in place and verified end-to-end with JS<->Python
-// forward-pass parity to ~1e-14, but neither the 20-iter nor 100-iter
-// training runs produced a network that beats this uniform-prior baseline
-// at the same search budget — the value head is degrading rather than
-// improving. Once the value-target problem is diagnosed and fixed, this
-// module will switch to import nn.js + weights.json.
+// Currently a double-dummy engine: PIMC ensemble over an exact alpha-beta
+// solver. See src/engine/dde.js and src/engine/doubleDummy.js.
+//
+// The previous neural-net engine (PIMC with a trained policy/value
+// network) is preserved verbatim in src/engine/neuralNet.js so it's
+// trivially revivable when we resume the AlphaZero path with a stronger
+// teacher signal.
 
-import { bestMoveByPimc } from './pimc.js'
-
-export function bestMove(state) {
-  return bestMoveByPimc(state)
-}
+export { bestMove } from './dde.js'

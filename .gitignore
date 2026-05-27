@@ -10,3 +10,6 @@ training/replays/
 training/*parity_expected.json
 __pycache__/
 *.pyc
+
+# Generated neural-net weights — regenerate via training/scripts/export_weights.py
+src/engine/weights.json
