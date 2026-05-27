@@ -65,6 +65,9 @@ function dealRound(roundNum, score) {
     trickNum: 1,
     phase: 'playing',
     lastTrick: null,
+    // Full per-round play history, in order. `lastTrick` is for the UI's
+    // single-trick replay; `trickHistory` is what the AI engine consumes.
+    trickHistory: [],
   }
 }
 
@@ -118,6 +121,8 @@ export function playCard(state, card) {
   const player = state.awaiting
   const handKey = player === HUMAN ? 'humanHand' : 'botHand'
   const newHand = removeCard(state[handKey], card)
+  const playEvent = { trick: state.trickNum, player, card }
+  const trickHistory = [...state.trickHistory, playEvent]
 
   // Leading the trick.
   if (state.ledCard === null) {
@@ -126,6 +131,7 @@ export function playCard(state, card) {
       [handKey]: newHand,
       ledCard: card,
       awaiting: otherPlayer(player),
+      trickHistory,
     }
   }
 
@@ -150,6 +156,7 @@ export function playCard(state, card) {
       leader: state.leader,
       winner,
     },
+    trickHistory,
   }
 }
 

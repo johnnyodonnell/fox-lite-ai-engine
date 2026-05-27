@@ -34,3 +34,21 @@ python -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_
 
 *Filled in as each phase lands.* See the project's plan at
 `~/.claude/plans/swirling-whistling-river.md` for the phase roadmap.
+
+### Parity with the browser engine
+
+`src/engine/game.js` is the source of truth for the rules; `games/foxlite.py`
+is a port. They are kept in lock-step by a deterministic corpus check:
+
+```sh
+node training/scripts/parity_corpus.mjs   # JS dumps reference outputs
+python training/scripts/parity_check.py   # Python replays and asserts
+```
+
+The corpus covers the full domain of `scoreForTricks` and `trickWinner`, a
+broad sample of `legalMoves`, and 200 full self-played game traces — every
+state transition through `playCard` / `advanceAfterTrick` / `endRound` is
+checked against the JS reference. Round transitions adopt the JS-side shuffle
+(we deliberately do not try to share an RNG between languages).
+
+The corpus file (`training/parity_expected.json`) is generated, not committed.
