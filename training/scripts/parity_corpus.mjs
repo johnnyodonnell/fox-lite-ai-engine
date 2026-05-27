@@ -31,6 +31,7 @@ import {
   advanceAfterTrick,
   endRound,
 } from '../../src/engine/game.js'
+import { encode, INPUT_SIZE } from '../../src/engine/nnGame.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const OUT_PATH = path.join(here, '..', 'parity_expected.json')
@@ -198,7 +199,33 @@ function playCardCorpus() {
   return games
 }
 
+// --- encode -----------------------------------------------------------------
+// Sample real game states from the playCard traces and encode each with both
+// mover=HUMAN and mover=BOT. Python's encoder must produce byte-identical
+// (float64) vectors.
+function encodeCorpus(gameTraces) {
+  const cases = []
+  const stride = 7 // sample every Nth event
+  let counter = 0
+  for (const g of gameTraces) {
+    for (const ev of g.trace) {
+      if (ev.kind !== 'play') continue
+      counter++
+      if (counter % stride !== 0) continue
+      if (ev.after.phase !== 'playing') continue // only states with an awaiting mover are interesting
+      const state = ev.after
+      for (const mover of [HUMAN, BOT]) {
+        cases.push({ state, mover, expected: encode(state, mover) })
+      }
+      if (cases.length >= 200) break
+    }
+    if (cases.length >= 200) break
+  }
+  return cases
+}
+
 // --- write ------------------------------------------------------------------
+const playCardData = playCardCorpus()
 const payload = {
   meta: {
     generator: 'parity_corpus.mjs',
@@ -207,11 +234,13 @@ const payload = {
     humanLabel: HUMAN,
     botLabel: BOT,
     numGames: NUM_GAMES,
+    inputSize: INPUT_SIZE,
   },
   scoreForTricks: scoreCorpus(),
   trickWinner: trickWinnerCorpus(),
   legalMoves: legalMovesCorpus(),
-  playCard: playCardCorpus(),
+  playCard: playCardData,
+  encode: encodeCorpus(playCardData),
 }
 
 fs.writeFileSync(OUT_PATH, JSON.stringify(payload))
@@ -220,5 +249,6 @@ console.log(
   `  scoreForTricks  : ${payload.scoreForTricks.length} cases\n` +
   `  trickWinner     : ${payload.trickWinner.length} cases\n` +
   `  legalMoves      : ${payload.legalMoves.length} cases\n` +
-  `  playCard games  : ${payload.playCard.length}`
+  `  playCard games  : ${payload.playCard.length}\n` +
+  `  encode          : ${payload.encode.length} cases`
 )

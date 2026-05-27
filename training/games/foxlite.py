@@ -236,3 +236,224 @@ def round_summary(state: dict) -> dict:
             "points": score_for_tricks(state["tricksWon"]["bot"]),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Search-side helpers (mirror src/engine/nnGame.js).
+# Used by the AlphaZero pipeline; not by parity-tested rule functions above.
+# ---------------------------------------------------------------------------
+
+CARDS_BY_INDEX: list[dict] = create_deck()
+# Cards are listed (suit_outer, rank_inner) matching the JS canonical order so
+# index 0 = bells-1, index 32 = moons-11. Used for both action indices and the
+# one-hot positions in encode().
+CARD_INDEX: dict[str, int] = {c["id"]: i for i, c in enumerate(CARDS_BY_INDEX)}
+NUM_CARDS = len(CARDS_BY_INDEX)
+TARGET_SCORE = 21
+
+
+def bot_infoset(state: dict) -> dict:
+    """Strip humanHand from a perfect-info state so search code can't peek."""
+    return {
+        "botHand": state["botHand"],
+        "trump": state["trump"],
+        "trickHistory": state["trickHistory"],
+        "leader": state["leader"],
+        "ledCard": state["ledCard"],
+        "awaiting": state["awaiting"],
+        "tricksWon": state["tricksWon"],
+        "score": state["score"],
+        "roundNum": state["roundNum"],
+        "trickNum": state["trickNum"],
+        "phase": state["phase"],
+    }
+
+
+def opponent_void_suits(infoset: dict) -> set[str]:
+    """Suits the opponent (HUMAN) has been observed to be void in."""
+    voids: set[str] = set()
+    by_trick: dict[int, list[dict]] = {}
+    for ev in infoset["trickHistory"]:
+        by_trick.setdefault(ev["trick"], []).append(ev)
+    for events in by_trick.values():
+        if len(events) < 2:
+            continue
+        lead, follow = events[0], events[1]
+        if follow["player"] == HUMAN and follow["card"]["suit"] != lead["card"]["suit"]:
+            voids.add(lead["card"]["suit"])
+    return voids
+
+
+def sample_determinization(
+    infoset: dict, rng: Optional[_random_module.Random] = None
+) -> dict:
+    """Sample a consistent opponent hand + unused pile from the bot's POV."""
+    rng = rng or _random_module.Random()
+    seen: set[str] = {c["id"] for c in infoset["botHand"]}
+    seen.add(infoset["trump"]["id"])
+    for ev in infoset["trickHistory"]:
+        seen.add(ev["card"]["id"])
+
+    unseen = [c for c in CARDS_BY_INDEX if c["id"] not in seen]
+    voids = opponent_void_suits(infoset)
+    allowed_for_opp = [c for c in unseen if c["suit"] not in voids]
+    must_go_unused = [c for c in unseen if c["suit"] in voids]
+
+    opp_played = sum(1 for ev in infoset["trickHistory"] if ev["player"] == HUMAN)
+    opp_hand_size = 13 - opp_played
+
+    if len(allowed_for_opp) < opp_hand_size:
+        raise ValueError(
+            f"Determinization impossible: {len(allowed_for_opp)} non-void cards "
+            f"available, opponent must hold {opp_hand_size}"
+        )
+
+    pool = list(allowed_for_opp)
+    rng.shuffle(pool)
+    opponent_hand = pool[:opp_hand_size]
+    unused_pile = pool[opp_hand_size:] + must_go_unused
+    return {"opponentHand": opponent_hand, "unusedPile": unused_pile}
+
+
+def world_from_determinization(state: dict, det: dict) -> dict:
+    """Splice the sampled opponent hand into a perfect-info world."""
+    return {**state, "humanHand": det["opponentHand"]}
+
+
+def step_world(world: dict, card: dict) -> dict:
+    """One half-move; auto-advances past trick-complete so MCTS sees plies."""
+    nxt = play_card(world, card)
+    while nxt["phase"] == "trick-complete":
+        nxt = advance_after_trick(nxt)
+    return nxt
+
+
+def is_world_terminal(world: dict) -> bool:
+    return world["phase"] in ("round-over", "match-over")
+
+
+def signed_margin_value(world: dict, mover: str) -> float:
+    """End-of-round signed point margin / 6, from `mover`'s perspective."""
+    bot_pts = score_for_tricks(world["tricksWon"]["bot"])
+    human_pts = score_for_tricks(world["tricksWon"]["human"])
+    v_bot = (bot_pts - human_pts) / 6
+    return v_bot if mover == BOT else -v_bot
+
+
+def rollout_value(
+    world: dict, mover: str, rng: Optional[_random_module.Random] = None
+) -> float:
+    """Uniform-random rollout to round-end. Value in `mover`'s frame."""
+    rng = rng or _random_module.Random()
+    s = world
+    while not is_world_terminal(s):
+        hand_key = "humanHand" if s["awaiting"] == HUMAN else "botHand"
+        legal = legal_moves(s[hand_key], s["ledCard"])
+        s = step_world(s, rng.choice(legal))
+    return signed_margin_value(s, mover)
+
+
+def legal_action_indices(world: dict) -> list[int]:
+    """Legal moves expressed as integer card indices, ascending."""
+    hand_key = "humanHand" if world["awaiting"] == HUMAN else "botHand"
+    legal = legal_moves(world[hand_key], world["ledCard"])
+    return sorted(CARD_INDEX[c["id"]] for c in legal)
+
+
+def card_from_index(idx: int) -> dict:
+    return CARDS_BY_INDEX[idx]
+
+
+# ---------------------------------------------------------------------------
+# Network input encoding — mirrors src/engine/nnGame.js encode().
+# Layout (cursor increments shown alongside, total = INPUT_SIZE):
+#   own hand                       33
+#   played pile                    33
+#   trump suit                      3
+#   trump card identity            33
+#   led card + "no-led" flag       34
+#   self tricks-won (one-hot 0..13) 14
+#   opp tricks-won                  14
+#   opp suit voids                   3   (only set when mover is the bot)
+#   "I led this trick" flag          1
+#   trick number (one-hot 1..13)    13
+#   self match score (scalar)        1
+#   opp match score (scalar)         1
+#   total                          183
+# ---------------------------------------------------------------------------
+
+INPUT_SIZE = 183
+
+
+def encode(state: dict, mover: Optional[str] = None) -> list[float]:
+    """Encode a state from `mover`'s perspective. Default mover = state.awaiting.
+
+    Mirrors src/engine/nnGame.js encode() byte-for-byte so parity check works.
+    """
+    if mover is None:
+        mover = state["awaiting"]
+    out = [0.0] * INPUT_SIZE
+    cursor = 0
+
+    mover_is_human = mover == HUMAN
+    own_hand = state["humanHand"] if mover_is_human else state["botHand"]
+    own_tricks = state["tricksWon"]["human"] if mover_is_human else state["tricksWon"]["bot"]
+    opp_tricks = state["tricksWon"]["bot"] if mover_is_human else state["tricksWon"]["human"]
+    own_score = state["score"]["human"] if mover_is_human else state["score"]["bot"]
+    opp_score = state["score"]["bot"] if mover_is_human else state["score"]["human"]
+
+    # own hand
+    for c in own_hand:
+        out[cursor + CARD_INDEX[c["id"]]] = 1.0
+    cursor += NUM_CARDS
+
+    # played pile
+    for ev in state["trickHistory"]:
+        out[cursor + CARD_INDEX[ev["card"]["id"]]] = 1.0
+    cursor += NUM_CARDS
+
+    # trump suit
+    out[cursor + SUITS.index(state["trump"]["suit"])] = 1.0
+    cursor += len(SUITS)
+
+    # trump card identity
+    out[cursor + CARD_INDEX[state["trump"]["id"]]] = 1.0
+    cursor += NUM_CARDS
+
+    # led card
+    if state["ledCard"] is not None:
+        out[cursor + CARD_INDEX[state["ledCard"]["id"]]] = 1.0
+    else:
+        out[cursor + NUM_CARDS] = 1.0
+    cursor += NUM_CARDS + 1
+
+    # self tricks (one-hot 0..13)
+    out[cursor + own_tricks] = 1.0
+    cursor += TRICKS_PER_ROUND + 1
+    # opp tricks
+    out[cursor + opp_tricks] = 1.0
+    cursor += TRICKS_PER_ROUND + 1
+
+    # opponent voids — only meaningful from the bot's view
+    if not mover_is_human:
+        for s in opponent_void_suits({"trickHistory": state["trickHistory"]}):
+            out[cursor + SUITS.index(s)] = 1.0
+    cursor += len(SUITS)
+
+    # leader-of-this-trick flag
+    out[cursor] = 1.0 if (state["leader"] == mover and state["ledCard"] is None) else 0.0
+    cursor += 1
+
+    # trick number 1..13
+    out[cursor + state["trickNum"] - 1] = 1.0
+    cursor += TRICKS_PER_ROUND
+
+    # scores as scalars
+    out[cursor] = own_score / TARGET_SCORE
+    cursor += 1
+    out[cursor] = opp_score / TARGET_SCORE
+    cursor += 1
+
+    if cursor != INPUT_SIZE:
+        raise RuntimeError(f"encoder cursor mismatch: {cursor} != {INPUT_SIZE}")
+    return out

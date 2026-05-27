@@ -163,13 +163,13 @@ export function rolloutValue(world, rng = Math.random) {
 //   ---
 //   total                      183
 
-const CARD_INDEX = (() => {
+export const CARD_INDEX = (() => {
   const map = new Map()
   let i = 0
   for (const s of SUITS) for (const r of RANKS) map.set(cardId(s, r), i++)
   return map
 })()
-const NUM_CARDS = SUITS.length * RANKS.length // 33
+export const NUM_CARDS = SUITS.length * RANKS.length // 33
 const TARGET_SCORE = 21
 
 export const INPUT_SIZE = 183

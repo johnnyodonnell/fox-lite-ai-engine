@@ -20,7 +20,9 @@ TRAINING_DIR = os.path.dirname(THIS_DIR)
 sys.path.insert(0, TRAINING_DIR)
 
 from games.foxlite import (  # noqa: E402
+    INPUT_SIZE,
     advance_after_trick,
+    encode,
     end_round,
     legal_moves,
     play_card,
@@ -162,6 +164,32 @@ def check_play_card(games) -> int:
     return failures
 
 
+def check_encode(cases) -> int:
+    """Verify Python's encoder produces byte-identical vectors to JS's."""
+    failures = 0
+    if cases and len(cases[0]["expected"]) != INPUT_SIZE:
+        print(
+            f"FAIL encode: corpus reports inputSize={len(cases[0]['expected'])} "
+            f"but Python's INPUT_SIZE={INPUT_SIZE}"
+        )
+        failures += 1
+    for i, c in enumerate(cases):
+        got = encode(c["state"], c["mover"])
+        if got != c["expected"]:
+            max_diff = max(abs(a - b) for a, b in zip(got, c["expected"]))
+            print(
+                f"FAIL encode[{i}]  mover={c['mover']}  trickNum={c['state']['trickNum']}  "
+                f"max abs diff={max_diff}"
+            )
+            # Show first few mismatched indices.
+            for j, (a, b) in enumerate(zip(got, c["expected"])):
+                if a != b:
+                    print(f"    idx {j}: got {a}, expected {b}")
+                    break
+            failures += 1
+    return failures
+
+
 def main() -> int:
     if not os.path.exists(CORPUS_PATH):
         print(
@@ -177,6 +205,7 @@ def main() -> int:
         ("trickWinner   ", check_trick_winner, corpus["trickWinner"]),
         ("legalMoves    ", check_legal_moves, corpus["legalMoves"]),
         ("playCard      ", check_play_card, corpus["playCard"]),
+        ("encode        ", check_encode, corpus.get("encode", [])),
     ]
     total_failures = 0
     for label, fn, cases in sections:
