@@ -2,10 +2,15 @@
 //
 //   bestMove(state) -> a card from state.botHand
 //
-// Phase 2: PIMC search with a uniform policy prior + uniform-random rollouts
-// to round-end as the leaf value estimate. No neural network yet — but the
-// search infrastructure is the one we'll keep, and Phase 3 swaps in a learned
-// prior + value via src/engine/nn.js without changing this file's contract.
+// CURRENT (Phase 2 / 3): PIMC search with a uniform policy prior + uniform-
+// random rollouts to round-end as the leaf value estimate. The full training
+// pipeline (training/alphazero/) is in place and verified end-to-end with
+// JS<->Python forward-pass parity to ~1e-14, but the initial 20-iteration
+// smoke training did not yet beat this uniform-prior baseline at the same
+// search budget — the value head's noise dominated the search. Phase 4
+// scales training until net+search clears the gate, at which point this
+// module switches to use nn.js + weights.json (the wiring is sketched in git
+// history; revert to that pattern after re-export).
 
 import { bestMoveByPimc } from './pimc.js'
 

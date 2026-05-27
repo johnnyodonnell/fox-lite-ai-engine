@@ -58,6 +58,7 @@ def main() -> None:
         "valueHead": _layer(net.value_head),
     }
 
+    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     with open(OUT_PATH, "w") as f:
         json.dump(data, f)
 

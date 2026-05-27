@@ -19,11 +19,12 @@ NUM_SIMULATIONS = 64
 # How many determinizations to ensemble per move at training time.
 NUM_DETERMINIZATIONS = 4
 
-# Higher search budgets used at evaluation / browser-deploy time. Browser
-# latency is unbounded per the project plan, so the eval bot searches deeper
-# than self-play does.
-PLAY_SIMULATIONS = 200
-PLAY_DETERMINIZATIONS = 16
+# Search budgets used at evaluation / browser-deploy time. The project plan
+# allows unbounded latency, but in practice a per-move budget of a few
+# hundred milliseconds keeps the UI responsive without giving up much
+# strength.
+PLAY_SIMULATIONS = 80
+PLAY_DETERMINIZATIONS = 8
 
 DIRICHLET_ALPHA = 0.5     # 33 cards but typically <= ~10 legal at a time
 DIRICHLET_EPSILON = 0.25  # mixing weight (self-play only)
