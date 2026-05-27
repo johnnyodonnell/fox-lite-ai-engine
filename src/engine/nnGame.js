@@ -49,9 +49,12 @@ export function botInfoset(state) {
   }
 }
 
-// Suits the opponent has been observed to be void in. Inferred from any
-// completed trick where the opponent failed to follow the led suit.
-export function opponentVoidSuits(infoset) {
+// Suits `opponent` has been observed to be void in. Inferred from any
+// completed trick where they failed to follow the led suit.
+// Default opponent=HUMAN keeps sampleDeterminization (always bot's POV)
+// working unchanged; encode() passes the actual opponent so the
+// mover-frame canonicalization is symmetric.
+export function opponentVoidSuits(infoset, opponent = HUMAN) {
   const voids = new Set()
   const byTrick = new Map()
   for (const ev of infoset.trickHistory) {
@@ -61,7 +64,7 @@ export function opponentVoidSuits(infoset) {
   for (const events of byTrick.values()) {
     if (events.length < 2) continue // current trick mid-play
     const [lead, follow] = events
-    if (follow.player === HUMAN && follow.card.suit !== lead.card.suit) {
+    if (follow.player === opponent && follow.card.suit !== lead.card.suit) {
       voids.add(lead.card.suit)
     }
   }
@@ -223,13 +226,10 @@ export function encode(state, mover = state.awaiting) {
   setOneHot(out, cursor, oppTricks)
   cursor += TRICKS_PER_ROUND + 1
 
-  // opponent's observed voids — only meaningful when mover is the bot
-  // (during a determinized rollout the "opponent" is whoever isn't moving,
-  // and that side's hand is already fully visible to the search).
-  if (!moverIsHuman) {
-    const voids = opponentVoidSuits({ trickHistory: state.trickHistory })
-    for (const s of voids) setOneHot(out, cursor, SUITS.indexOf(s))
-  }
+  // opponent voids — mover-symmetric: encode the OTHER seat's voids.
+  const oppPlayer = moverIsHuman ? BOT : HUMAN
+  const voids = opponentVoidSuits({ trickHistory: state.trickHistory }, oppPlayer)
+  for (const s of voids) setOneHot(out, cursor, SUITS.indexOf(s))
   cursor += SUITS.length
 
   // leader-of-this-trick flag

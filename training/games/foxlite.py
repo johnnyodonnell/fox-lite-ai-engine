@@ -269,8 +269,14 @@ def bot_infoset(state: dict) -> dict:
     }
 
 
-def opponent_void_suits(infoset: dict) -> set[str]:
-    """Suits the opponent (HUMAN) has been observed to be void in."""
+def opponent_void_suits(infoset: dict, opponent: str = HUMAN) -> set[str]:
+    """Suits `opponent` has been observed to be void in.
+
+    Default opponent=HUMAN preserves the existing call site in
+    sample_determinization (which is always from the bot's POV). encode()
+    passes the actual opponent so the mover-frame canonicalization is
+    symmetric.
+    """
     voids: set[str] = set()
     by_trick: dict[int, list[dict]] = {}
     for ev in infoset["trickHistory"]:
@@ -279,7 +285,7 @@ def opponent_void_suits(infoset: dict) -> set[str]:
         if len(events) < 2:
             continue
         lead, follow = events[0], events[1]
-        if follow["player"] == HUMAN and follow["card"]["suit"] != lead["card"]["suit"]:
+        if follow["player"] == opponent and follow["card"]["suit"] != lead["card"]["suit"]:
             voids.add(lead["card"]["suit"])
     return voids
 
@@ -434,10 +440,10 @@ def encode(state: dict, mover: Optional[str] = None) -> list[float]:
     out[cursor + opp_tricks] = 1.0
     cursor += TRICKS_PER_ROUND + 1
 
-    # opponent voids — only meaningful from the bot's view
-    if not mover_is_human:
-        for s in opponent_void_suits({"trickHistory": state["trickHistory"]}):
-            out[cursor + SUITS.index(s)] = 1.0
+    # opponent voids — mover-symmetric: encode the OTHER seat's voids.
+    opp_player = BOT if mover_is_human else HUMAN
+    for s in opponent_void_suits({"trickHistory": state["trickHistory"]}, opp_player):
+        out[cursor + SUITS.index(s)] = 1.0
     cursor += len(SUITS)
 
     # leader-of-this-trick flag
