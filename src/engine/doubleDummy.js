@@ -26,6 +26,7 @@ import {
   scoreForTricks,
 } from './game.js'
 import { CARD_INDEX } from './nnGame.js'
+import * as endgame from './endgame.js'
 
 // TT entry flag values.
 const EXACT = 0
@@ -140,6 +141,15 @@ export function solve(world, alpha, beta, tt, rootMover) {
     return { value: leafMargin(world, rootMover), bestMove: null }
   }
 
+  // Endgame DB lookup. Stored values are in the to-move player's frame at
+  // the cached state; solve()'s contract is root-mover's frame, so negate
+  // when the cached state's mover differs from the root mover.
+  const dbHit = endgame.lookup(world)
+  if (dbHit !== null) {
+    const value = world.awaiting === rootMover ? dbHit : -dbHit
+    return { value, flag: EXACT, bestMove: null }
+  }
+
   const origAlpha = alpha
   const origBeta = beta
   const key = ttKey(world)
@@ -187,6 +197,14 @@ export function solve(world, alpha, beta, tt, rootMover) {
 
   const entry = { value: bestVal, flag, bestMove: bestMoveId }
   tt.set(key, entry)
+
+  // Cache exact values into the endgame DB in to-move-player's frame.
+  // Bounded (LOWER/UPPER) values aren't true minimax and would corrupt the DB.
+  if (flag === EXACT) {
+    const dbValue = world.awaiting === rootMover ? bestVal : -bestVal
+    endgame.put(world, dbValue)
+  }
+
   return entry
 }
 

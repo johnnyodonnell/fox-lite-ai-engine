@@ -25,6 +25,7 @@ import {
 } from './nnGame.js'
 import { bestMoveByPimc, uniformRolloutEvaluator } from './pimc.js'
 import { solveRoot } from './doubleDummy.js'
+import * as endgame from './endgame.js'
 
 // Per-decision wall-clock budget. The deployed UI tolerates up to 3 s on
 // the worst position; we leave headroom so an in-flight solve doesn't push
@@ -63,6 +64,7 @@ export function bestMove(state, opts = {}) {
   if (legal.length === 0) return null
   if (legal.length === 1) return legal[0]
 
+  endgame.resetStats()
   const t0 = now()
   const infoset = botInfoset(state)
   const K = plannedK(state.trickNum)
@@ -111,5 +113,9 @@ export function bestMove(state, opts = {}) {
       best = cardId
     }
   }
+
+  const s = endgame.stats()
+  console.log(`[endgame] hits=${s.hits} misses=${s.misses} size=${s.size}`)
+
   return state.botHand.find((c) => c.id === best) ?? legal[0]
 }
