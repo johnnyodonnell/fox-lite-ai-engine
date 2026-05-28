@@ -114,6 +114,50 @@ export function worldFromDeterminization(state, det) {
   return { ...state, humanHand: det.opponentHand }
 }
 
+// Heuristic posterior weight on a candidate opponent hand given the bot's
+// observed history. Used by PIMC-aggregating engines to downweight worlds
+// where the opponent's plays would have been implausible.
+//
+// Rule of thumb: opponents tend to lead from longer suits (more options to
+// continue the suit, more chances to win subsequent tricks of it). For
+// each opponent-led trick, weight the candidate world by (opp's count of
+// that suit at the time of leading) / (per-suit average for that hand
+// size), clamped to [0.3, 2.0] so no single event dominates.
+//
+// Suit counts at past events are reconstructed by adding back any cards
+// the opponent has played at or after that event to the candidate
+// end-of-history hand.
+export function beliefWeight(infoset, candidateOppHand) {
+  let weight = 1.0
+  // Pre-compute the first event index per trick (the lead).
+  const firstByTrick = new Map()
+  for (let i = 0; i < infoset.trickHistory.length; i++) {
+    const ev = infoset.trickHistory[i]
+    if (!firstByTrick.has(ev.trick)) firstByTrick.set(ev.trick, i)
+  }
+  for (let i = 0; i < infoset.trickHistory.length; i++) {
+    const ev = infoset.trickHistory[i]
+    if (ev.player !== HUMAN) continue
+    if (firstByTrick.get(ev.trick) !== i) continue // opp followed, not led
+    let suitCount = 0
+    let handSize = 0
+    for (const c of candidateOppHand) {
+      handSize += 1
+      if (c.suit === ev.card.suit) suitCount += 1
+    }
+    for (let j = i; j < infoset.trickHistory.length; j++) {
+      const later = infoset.trickHistory[j]
+      if (later.player !== HUMAN) continue
+      handSize += 1
+      if (later.card.suit === ev.card.suit) suitCount += 1
+    }
+    const avgSuitLen = handSize / SUITS.length
+    const factor = Math.max(0.3, Math.min(2.0, suitCount / avgSuitLen))
+    weight *= factor
+  }
+  return weight
+}
+
 // One half-move of the world. After a follower plays we auto-advance past
 // the trick-complete phase so MCTS sees seamless transitions.
 export function stepWorld(world, card) {
