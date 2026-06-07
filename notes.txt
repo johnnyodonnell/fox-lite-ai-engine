@@ -1,0 +1,4 @@
+
+- Feature ideas
+    - Include the full hand history as input into the NN model
+
