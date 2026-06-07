@@ -5,7 +5,7 @@ import RoundBanner from './components/RoundBanner.jsx'
 import Status from './components/Status.jsx'
 import Trick from './components/Trick.jsx'
 import Trump from './components/Trump.jsx'
-import { bestMove } from './engine/random.js'
+import { bestMove, preload } from './engine/neural.js'
 import {
   BOT,
   HUMAN,
@@ -44,13 +44,26 @@ export default function App() {
     return () => clearTimeout(id)
   }, [state.phase])
 
-  // Bot plays instantly whenever it's the bot's turn.
+  // Warm the ONNX session once so the first bot move isn't slow.
+  useEffect(() => {
+    preload()
+  }, [])
+
+  // Bot plays whenever it's the bot's turn (async: one neural-net forward pass).
   useEffect(() => {
     if (state.phase !== 'playing' || state.awaiting !== BOT) return
-    setState((s) => {
-      if (s.phase !== 'playing' || s.awaiting !== BOT) return s
-      return playCard(s, bestMove(s))
-    })
+    let cancelled = false
+    ;(async () => {
+      const card = await bestMove(state)
+      if (cancelled) return
+      setState((s) => {
+        if (s.phase !== 'playing' || s.awaiting !== BOT) return s
+        return playCard(s, card)
+      })
+    })()
+    return () => {
+      cancelled = true
+    }
   }, [state.phase, state.awaiting])
 
   function handleHumanPlay(card) {
