@@ -125,9 +125,11 @@ export default function App() {
 
       <BotHand count={state.botHand.length} />
 
-      <div className="table">
+      <div className="table-area">
         <Trump card={state.trump} />
-        <Trick {...trickDisplay} />
+        <div className="table">
+          <Trick {...trickDisplay} />
+        </div>
       </div>
 
       <Hand

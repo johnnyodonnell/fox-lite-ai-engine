@@ -80,11 +80,17 @@ h1 {
 
 /* table layout */
 
+.table-area {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .table {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 2rem;
   padding: 1.25rem 2rem;
   background: var(--surface);
   border: 1px solid var(--line);
@@ -225,10 +231,27 @@ h1 {
 /* trump */
 
 .trump {
+  position: absolute;
+  right: calc(100% + 2.5rem);
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 0.35rem;
+}
+
+.trump .card {
+  width: 48px;
+  height: 72px;
+}
+
+.trump .card__rank {
+  font-size: 1.05rem;
+}
+
+.trump .card__suit {
+  font-size: 1.2rem;
 }
 
 .trump__label {
