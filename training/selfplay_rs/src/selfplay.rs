@@ -57,7 +57,7 @@ impl Game {
 }
 
 /// Temperature softmax over legal logits, then sample a canonical card index.
-fn sample_action(logits: &[f32], mask: &[f32; NUM_CARDS], temp: f64, rng: &mut StdRng) -> usize {
+pub(crate) fn sample_action(logits: &[f32], mask: &[f32; NUM_CARDS], temp: f64, rng: &mut StdRng) -> usize {
     let legal: Vec<usize> = (0..NUM_CARDS).filter(|&j| mask[j] != 0.0).collect();
     let t = temp.max(1e-6) as f32;
     let maxl = legal
@@ -201,7 +201,7 @@ pub fn run(cfg: Config) {
     );
 }
 
-fn write_cohort(path: &str, rows: &[f32], n_rows: usize) {
+pub(crate) fn write_cohort(path: &str, rows: &[f32], n_rows: usize) {
     assert_eq!(rows.len(), n_rows * ROW_FLOATS, "row buffer size mismatch");
     let f = File::create(path).unwrap_or_else(|e| panic!("create {path}: {e}"));
     let mut w = BufWriter::new(f);

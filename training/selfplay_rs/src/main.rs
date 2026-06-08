@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use tch::{Device, Kind, Tensor};
 
 use selfplay_rs::net::Net;
+use selfplay_rs::pipeline;
 use selfplay_rs::selfplay;
 
 /// Read a `--key value` flag, falling back to `default`.
@@ -105,8 +106,24 @@ fn main() {
             };
             selfplay::run(cfg);
         }
+        "selfplay-pipe" => {
+            let batch: usize = flag(&args, "--batch", "512").parse().unwrap();
+            let cfg = pipeline::Config {
+                weights: flag(&args, "--weights", "weights.safetensors"),
+                out: flag(&args, "--out", "cohort.bin"),
+                matches: flag(&args, "--matches", "1024").parse().unwrap(),
+                batch,
+                // default concurrency = 2x batch (overlaps CPU game logic with the GPU forward)
+                concurrency: flag(&args, "--concurrency", &(2 * batch).to_string()).parse().unwrap(),
+                n_threads: flag(&args, "--threads", "8").parse().unwrap(),
+                temperature: flag(&args, "--temperature", "1.0").parse().unwrap(),
+                seed: flag(&args, "--seed", "0").parse().unwrap(),
+                cpu: args.iter().any(|a| a == "--cpu"),
+            };
+            pipeline::run(cfg);
+        }
         other => {
-            eprintln!("unknown subcommand {other:?}; expected: forward-check | selfplay");
+            eprintln!("unknown subcommand {other:?}; expected: forward-check | selfplay | selfplay-pipe");
             std::process::exit(2);
         }
     }

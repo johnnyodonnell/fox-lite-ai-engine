@@ -58,7 +58,12 @@ def parse_args():
     ap.add_argument("--out-dir", default="runs/run1")
     ap.add_argument("--snapshot-every", default="30m")
     ap.add_argument("--matches", type=int, default=2048, help="matches per cohort")
-    ap.add_argument("--selfplay-batch", type=int, default=1024)
+    ap.add_argument("--selfplay-batch", type=int, default=1024, help="GPU forward width")
+    # Parallel self-play pipeline: N game-worker threads feed one batched-inference
+    # thread (CPU game logic overlaps the GPU forward). 0 concurrency => 2x batch.
+    ap.add_argument("--selfplay-threads", type=int, default=16, help="self-play worker threads")
+    ap.add_argument("--selfplay-concurrency", type=int, default=0,
+                    help="games kept in flight (0 = 2x batch); > batch overlaps CPU with GPU")
     ap.add_argument("--temperature", type=float, default=1.0)
     # Large minibatches => only a handful of SGD steps per cohort, so the policy
     # stays close to the behavior policy that generated the on-policy cohort.
@@ -168,12 +173,15 @@ def main():
     while True:
         t0 = time.time()
         seed = args.seed + total_cohorts * 7919 + 1
+        concurrency = args.selfplay_concurrency or 2 * args.selfplay_batch
         subprocess.run(
-            [str(SELFPLAY_BIN), "selfplay",
+            [str(SELFPLAY_BIN), "selfplay-pipe",
              "--weights", str(serving_st),
              "--out", str(cohort_path),
              "--matches", str(args.matches),
              "--batch", str(args.selfplay_batch),
+             "--concurrency", str(concurrency),
+             "--threads", str(args.selfplay_threads),
              "--temperature", str(args.temperature),
              "--seed", str(seed)],
             cwd=str(HERE), env=env, check=True,

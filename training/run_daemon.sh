@@ -18,7 +18,8 @@ exec python orchestrator.py \
   --out-dir "${OUT_DIR:-runs/run1}" \
   --snapshot-every "${SNAPSHOT_EVERY:-30m}" \
   --matches "${MATCHES:-2048}" \
-  --selfplay-batch "${SELFPLAY_BATCH:-2048}" \
+  --selfplay-batch "${SELFPLAY_BATCH:-1024}" \
+  --selfplay-threads "${SELFPLAY_THREADS:-16}" \
   --sgd-batch "${SGD_BATCH:-65536}" \
   --lr "${LR:-1e-3}" \
   --c-entropy "${C_ENTROPY:-0.05}" \
