@@ -72,7 +72,9 @@ def parse_args():
     ap.add_argument("--max-cohorts", type=int, default=0, help="0 = run forever")
     ap.add_argument("--no-eval", action="store_true")
     ap.add_argument("--eval-games", type=int, default=200, help="matches per opponent")
-    ap.add_argument("--eval-pool", type=int, default=6, help="recent snapshots in pool")
+    ap.add_argument("--n-top", type=int, default=2, help="top-rated models kept as opponents")
+    ap.add_argument("--n-anchors", type=int, default=3,
+                    help="frozen snapshots spread across the Elo range as opponents")
     return ap.parse_args()
 
 
@@ -146,29 +148,21 @@ def main():
         return st_path
 
     def run_eval(st_path):
+        # The Rust evaluator owns the pool/Elo bookkeeping: it picks the active
+        # opponent set (top-N + random + spread anchors) from pool.json, plays
+        # the matches, refits a global Bradley-Terry Elo, and writes pool.json.
+        # It streams its own `[eval]` logs to our stdout.
         if args.no_eval or not EVAL_BIN.exists():
             return
         try:
-            res = subprocess.run(
+            subprocess.run(
                 [str(EVAL_BIN), "--run-dir", str(out_dir), "--candidate", str(st_path),
-                 "--games", str(args.eval_games), "--pool-size", str(args.eval_pool),
-                 "--seed", str(total_cohorts)],
+                 "--games", str(args.eval_games), "--n-top", str(args.n_top),
+                 "--n-anchors", str(args.n_anchors), "--seed", str(total_cohorts)],
                 cwd=str(HERE), env=worker_env(), check=True,
-                capture_output=True, text=True,
             )
         except subprocess.CalledProcessError as e:
-            print(f"[eval] failed: {e.stderr}", flush=True)
-            return
-        try:
-            data = json.loads(res.stdout.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError) as e:
-            print(f"[eval] parse failed: {e}\n{res.stdout}", flush=True)
-            return
-        from elo import update_ladder
-        rating = update_ladder(str(out_dir), data["candidate"], data["results"], t=round(elapsed(), 1))
-        vr = next((r for r in data["results"] if r["opponent"] == "random"), None)
-        wr = (100.0 * vr["wins"] / vr["games"]) if vr else float("nan")
-        print(f"[eval] {data['candidate']} elo={rating:.0f} vs_random={wr:.1f}%", flush=True)
+            print(f"[eval] failed (exit {e.returncode})", flush=True)
 
     env = worker_env()
     while True:

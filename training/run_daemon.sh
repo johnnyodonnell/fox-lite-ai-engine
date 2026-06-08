@@ -23,5 +23,6 @@ exec python orchestrator.py \
   --lr "${LR:-1e-3}" \
   --c-entropy "${C_ENTROPY:-0.05}" \
   --eval-games "${EVAL_GAMES:-200}" \
-  --eval-pool "${EVAL_POOL:-8}" \
+  --n-top "${N_TOP:-2}" \
+  --n-anchors "${N_ANCHORS:-3}" \
   --seed "${SEED:-42}"
