@@ -28,7 +28,7 @@ function statusMessage(state) {
   if (state.phase === 'round-over') return 'Round complete'
   if (state.phase === 'match-over') return 'Match complete'
   if (state.awaiting === HUMAN) {
-    return state.ledCard ? 'Your turn — follow' : 'Your turn — lead'
+    return state.ledCard ? '' : 'Your turn — lead'
   }
   return 'Bot is playing…'
 }
@@ -116,7 +116,6 @@ export default function App() {
 
       <Status
         message={statusMessage(state)}
-        roundNum={state.roundNum}
         humanScore={state.score.human}
         botScore={state.score.bot}
       />
