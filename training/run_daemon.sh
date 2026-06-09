@@ -25,13 +25,13 @@ fi
 exec python orchestrator.py \
   --out-dir "${OUT_DIR:-runs/run2}" \
   --snapshot-every "${SNAPSHOT_EVERY:-30m}" \
-  --sims "${SIMS:-400}" \
+  --sims "${SIMS:-200}" \
   --threads "${THREADS:-16}" \
   --slots "${SLOTS:-2}" \
   --selfplay-batch "${SELFPLAY_BATCH:-512}" \
   --batch-size "${BATCH_SIZE:-256}" \
   --lr "${LR:-2e-3}" \
-  --eval-games "${EVAL_GAMES:-30}" \
-  --eval-sims "${EVAL_SIMS:-100}" \
+  --eval-games "${EVAL_GAMES:-100}" \
+  --eval-sims "${EVAL_SIMS:-200}" \
   --seed "${SEED:-42}" \
   "${INIT_ARGS[@]}"

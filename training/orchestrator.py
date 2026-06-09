@@ -93,7 +93,7 @@ def parse_args():
                     help="How often to republish serving_weights.safetensors "
                          "(the worker hot-reloads it on mtime change).")
     # self-play worker (ISMCTS)
-    ap.add_argument("--sims", type=int, default=400)
+    ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--threads", type=int, default=16, help="MCTS worker threads")
     ap.add_argument("--slots", type=int, default=2, help="GPU forwards in flight")
     ap.add_argument("--selfplay-batch", type=int, default=512, help="GPU forward width")
@@ -112,10 +112,11 @@ def parse_args():
     ap.add_argument("--log-every", type=float, default=30.0)
     # evaluation (ISMCTS)
     ap.add_argument("--no-eval", action="store_true")
-    ap.add_argument("--eval-games", type=int, default=30, help="matches per opponent")
-    ap.add_argument("--eval-sims", type=int, default=100,
-                    help="ISMCTS eval is synchronous (batch-1), so keep this well "
-                         "below self-play --sims to fit inside the snapshot interval")
+    ap.add_argument("--eval-games", type=int, default=100, help="matches per opponent")
+    ap.add_argument("--eval-sims", type=int, default=200,
+                    help="ISMCTS eval is synchronous (batch-1); at a full opponent "
+                         "pool an eval can outlast the snapshot interval, in which "
+                         "case the eval.lock skips the overlapping snapshot's eval")
     ap.add_argument("--n-top", type=int, default=2)
     ap.add_argument("--n-anchors", type=int, default=3)
     return ap.parse_args()
