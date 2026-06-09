@@ -408,6 +408,7 @@ struct WorkItem {
 struct Infer {
     net: Net,
     dev: Device,
+    kind: Kind, // forward dtype: bf16 on CUDA (tensor cores + half the memory traffic), fp32 on CPU
     weights_path: String,
     reload_every: Duration,
     last_check: Instant,
@@ -415,9 +416,14 @@ struct Infer {
 }
 impl Infer {
     fn new(config: &Config, dev: Device) -> Infer {
+        // The forward is dominated by fp32 sgemm (memory-bound, no tensor cores);
+        // bf16 halves the H2D + weight/activation traffic and uses tensor cores.
+        // CPU bf16 is slow/uneven, so the CPU fallback stays fp32.
+        let kind = if matches!(dev, Device::Cuda(_)) { Kind::BFloat16 } else { Kind::Float };
         Infer {
-            net: Net::load(&config.weights_path, dev, Kind::Float),
+            net: Net::load(&config.weights_path, dev, kind),
             dev,
+            kind,
             last_mtime: std::fs::metadata(&config.weights_path).and_then(|m| m.modified()).ok(),
             weights_path: config.weights_path.clone(),
             reload_every: config.reload_every,
@@ -439,8 +445,11 @@ impl Infer {
     /// Launch one async forward over `m` staged encodings; returns the GPU output
     /// tensors + a completion event (the scatter thread reads them back).
     fn launch(&self, enc: &[f32], m: usize) -> (Tensor, Tensor, CudaEvent) {
+        // Narrow to the forward dtype on the CPU side so the H2D copy moves half
+        // the bytes (bf16), then ship to the device.
         let x = Tensor::from_slice(enc)
             .reshape([m as i64, ENC_LEN as i64])
+            .to_kind(self.kind)
             .to_device(self.dev);
         let (logits, values) = self.net.forward(&x);
         let logits = logits.to_kind(Kind::Float);
