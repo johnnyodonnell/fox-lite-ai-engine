@@ -165,7 +165,12 @@ impl PreInfer {
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::Relaxed);
+        // Set `closed` under `inner` (the gather/push predicate mutex) so a waiter
+        // that just read closed=false can't park and miss this shutdown wakeup.
+        {
+            let _q = self.inner.lock().unwrap();
+            self.closed.store(true, Ordering::Relaxed);
+        }
         self.not_empty.notify_all();
         self.not_full.notify_all();
     }
@@ -282,12 +287,19 @@ fn complete_one(shared: &Shared) {
     let mut r = shared.ready.lock().unwrap();
     r.in_flight -= 1;
     let live = r.in_flight;
-    shared.in_flight.store(live as u64, Ordering::Release);
     let done = r.started >= shared.matches && live == 0;
     drop(r);
-    // in_flight shrank: wake the gather (its partial-batch predicate may now fire)
-    // and, if the cohort just completed, wake everyone to shut down cleanly.
+    // in_flight shrank, so the gather's partial-batch predicate (`q.len() >= in_flight`)
+    // may now fire. Publish the shrunk count under the *preinfer* lock so the store and
+    // the notify are serialized against gather's predicate check on the same mutex —
+    // otherwise gather can read the old count, decide to wait, and miss this notify
+    // (lost wakeup -> the cohort's tail hangs forever).
+    {
+        let _q = shared.preinfer.inner.lock().unwrap();
+        shared.in_flight.store(live as u64, Ordering::Release);
+    }
     shared.preinfer.not_empty.notify_all();
+    // If the cohort just completed, wake everyone to shut down cleanly.
     if done {
         shared.ready_cv.notify_all();
         shared.preinfer.close();
