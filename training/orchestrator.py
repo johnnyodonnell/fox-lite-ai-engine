@@ -64,6 +64,10 @@ def parse_args():
     ap.add_argument("--selfplay-threads", type=int, default=16, help="self-play worker threads")
     ap.add_argument("--selfplay-concurrency", type=int, default=0,
                     help="games kept in flight (0 = 2x batch); > batch overlaps CPU with GPU")
+    # Forwards in flight: the inference thread launches the next batch while a
+    # scatter thread reads back the previous forward (keeps the GPU fed). 2 = double-buffer.
+    ap.add_argument("--selfplay-slots", type=int, default=2,
+                    help="GPU forwards kept in flight (inference runs ahead of scatter)")
     ap.add_argument("--temperature", type=float, default=1.0)
     # Large minibatches => only a handful of SGD steps per cohort, so the policy
     # stays close to the behavior policy that generated the on-policy cohort.
@@ -182,6 +186,7 @@ def main():
              "--batch", str(args.selfplay_batch),
              "--concurrency", str(concurrency),
              "--threads", str(args.selfplay_threads),
+             "--slots", str(args.selfplay_slots),
              "--temperature", str(args.temperature),
              "--seed", str(seed)],
             cwd=str(HERE), env=env, check=True,

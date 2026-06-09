@@ -24,6 +24,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -35,6 +36,7 @@ use tch::{Device, Kind, Tensor};
 use foxlite_core::encode::{encode, legal_mask, real_card_from_canon_index, INPUT_SIZE};
 use foxlite_core::{Phase, Player, State, NUM_CARDS};
 
+use crate::cuda_event::CudaEvent;
 use crate::net::Net;
 use crate::selfplay::{sample_action, write_cohort};
 
@@ -45,6 +47,7 @@ pub struct Config {
     pub batch: usize,       // GPU forward width (max rows per forward)
     pub concurrency: usize, // games kept in flight; > batch overlaps CPU with GPU
     pub n_threads: usize,   // game-worker threads
+    pub slots: usize,       // forwards in flight (inference can run ahead of scatter)
     pub temperature: f64,
     pub seed: u64,
     pub cpu: bool,
@@ -312,12 +315,32 @@ fn worker_loop(shared: Arc<Shared>) -> WorkerOut {
     out
 }
 
-fn inference_loop(shared: Arc<Shared>, net: &Net, dev: Device, batch: usize) {
+/// One in-flight forward handed from the inference thread to the scatter thread.
+/// `logits` is still on the GPU; the scatter thread reads it back (D2H) after the
+/// `event` fires, so the readback overlaps the inference thread's next forward.
+struct WorkItem {
+    games: Vec<Box<InFlight>>,
+    logits: Tensor, // GPU [m, NUM_CARDS]
+    event: CudaEvent,
+}
+
+/// Inference (GPU producer): gather a batch off the pre-inference queue, copy it
+/// to the device, launch the forward, record a completion event, and hand the
+/// in-flight forward to the scatter thread — then immediately loop to launch the
+/// next batch. The readback (the old blocking `to_device(Cpu)`) now lives on the
+/// scatter thread, so this thread never blocks on the GPU and keeps it fed.
+fn inference_loop(
+    shared: Arc<Shared>,
+    net: &Net,
+    dev: Device,
+    batch: usize,
+    work_tx: SyncSender<WorkItem>,
+) {
     let mut enc_flat: Vec<f32> = Vec::with_capacity(batch * INPUT_SIZE);
     loop {
         let games = match shared.preinfer.gather(batch, &shared.in_flight) {
             Some(g) => g,
-            None => return,
+            None => return, // closed (shutdown): dropping work_tx drains the scatter thread
         };
         let m = games.len();
         enc_flat.clear();
@@ -327,8 +350,25 @@ fn inference_loop(shared: Arc<Shared>, net: &Net, dev: Device, batch: usize) {
         let x = Tensor::from_slice(&enc_flat)
             .reshape([m as i64, INPUT_SIZE as i64])
             .to_device(dev);
-        let (logits, _v) = net.forward(&x);
-        let logits = logits.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
+        let (logits, _v) = net.forward(&x); // async on the stream
+        let logits = logits.to_kind(Kind::Float); // stays on GPU; scatter reads it back
+        let event = CudaEvent::new();
+        event.record(); // fires when this forward completes
+        if work_tx.send(WorkItem { games, logits, event }).is_err() {
+            return; // scatter gone
+        }
+    }
+}
+
+/// Scatter (GPU consumer): wait each forward's event, read its logits back to the
+/// host, attach each game's (shared logits, row), and requeue it for a worker.
+/// Overlaps the inference thread's next forward. Exits when the inference thread
+/// drops `work_tx` (shutdown) and the channel drains.
+fn scatter_loop(shared: Arc<Shared>, work_rx: Receiver<WorkItem>) {
+    while let Ok(item) = work_rx.recv() {
+        item.event.sync(); // wait the forward
+        let m = item.games.len();
+        let logits = item.logits.to_device(Device::Cpu).contiguous();
         // One host buffer per forward, shared by Arc; workers slice their own row.
         let mut host = vec![0f32; m * NUM_CARDS];
         logits.copy_data(&mut host, m * NUM_CARDS);
@@ -336,7 +376,7 @@ fn inference_loop(shared: Arc<Shared>, net: &Net, dev: Device, batch: usize) {
 
         // Attach each game's (shared logits, row) and requeue for a worker.
         let mut r = shared.ready.lock().unwrap();
-        for (k, mut g) in games.into_iter().enumerate() {
+        for (k, mut g) in item.games.into_iter().enumerate() {
             g.pending = Some((Arc::clone(&host), k));
             r.queue.push_back(g);
         }
@@ -359,6 +399,7 @@ pub fn run(cfg: Config) {
     let batch = cfg.batch.max(1).min(cfg.matches.max(1));
     let concurrency = cfg.concurrency.max(batch).min(cfg.matches.max(1));
     let n_threads = cfg.n_threads.max(1);
+    let slots = cfg.slots.max(1);
     // Pre-inference cap >= concurrency so every in-flight game can be queued at
     // once (the bulk-synchronous limit); 2x leaves slack for pipelined refills.
     let cap = (2 * concurrency).max(batch);
@@ -387,8 +428,19 @@ pub fn run(cfg: Config) {
         })
         .collect();
 
-    // Inference runs on this thread (owns the net / GPU).
-    inference_loop(shared.clone(), &net, dev, batch);
+    // The scatter thread reads each forward's logits back to the host and requeues
+    // the games; bound the channel at `slots` so the inference thread can run at
+    // most `slots` forwards ahead of the readback (backpressure).
+    let (work_tx, work_rx) = sync_channel::<WorkItem>(slots);
+    let scatter = {
+        let sh = shared.clone();
+        thread::spawn(move || scatter_loop(sh, work_rx))
+    };
+
+    // Inference runs on this thread (owns the net / GPU). On shutdown it returns
+    // and drops `work_tx`, which drains and ends the scatter thread.
+    inference_loop(shared.clone(), &net, dev, batch, work_tx);
+    scatter.join().expect("scatter thread panicked");
 
     // Merge the per-worker cohort buffers (concatenated; row order is arbitrary,
     // which is fine — the trainer shuffles).
@@ -407,7 +459,7 @@ pub fn run(cfg: Config) {
     write_cohort(&cfg.out, &rows, n_rows);
     let secs = start.elapsed().as_secs_f64();
     eprintln!(
-        "self-play (pipeline): {} matches, {} rows ({:.1}/match), wins[H,B]={:?}, {} threads, batch {}, conc {}, {:.1}s, {:.0} matches/s, {:.0} rows/s",
+        "self-play (pipeline): {} matches, {} rows ({:.1}/match), wins[H,B]={:?}, {} threads, batch {}, conc {}, slots {}, {:.1}s, {:.0} matches/s, {:.0} rows/s",
         finished,
         n_rows,
         n_rows as f64 / finished.max(1) as f64,
@@ -415,6 +467,7 @@ pub fn run(cfg: Config) {
         n_threads,
         batch,
         concurrency,
+        slots,
         secs,
         finished as f64 / secs,
         n_rows as f64 / secs,

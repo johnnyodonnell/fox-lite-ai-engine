@@ -116,6 +116,9 @@ fn main() {
                 // default concurrency = 2x batch (overlaps CPU game logic with the GPU forward)
                 concurrency: flag(&args, "--concurrency", &(2 * batch).to_string()).parse().unwrap(),
                 n_threads: flag(&args, "--threads", "8").parse().unwrap(),
+                // forwards in flight: inference can run this many forwards ahead of the
+                // scatter thread's readback (2 = double-buffer; keeps the GPU fed).
+                slots: flag(&args, "--slots", "2").parse().unwrap(),
                 temperature: flag(&args, "--temperature", "1.0").parse().unwrap(),
                 seed: flag(&args, "--seed", "0").parse().unwrap(),
                 cpu: args.iter().any(|a| a == "--cpu"),
