@@ -1,4 +1,6 @@
-export default function RoundBanner({ type, summary, score, onContinue }) {
+import { HUMAN } from '../engine/game.js'
+
+export default function RoundBanner({ type, summary, score, winner, onContinue }) {
   if (type === 'round') {
     return (
       <div className="banner">
@@ -34,17 +36,13 @@ export default function RoundBanner({ type, summary, score, onContinue }) {
     )
   }
 
-  // match-over
-  const winner =
-    score.human > score.bot
-      ? 'You win the match!'
-      : score.bot > score.human
-        ? 'Bot wins the match'
-        : "It's a tie"
+  // match-over. The winner is decided by the engine (matchWinner), which breaks
+  // a tie on total points by the final round's points — so there is no draw.
+  const title = winner === HUMAN ? 'You win the match!' : 'Bot wins the match'
 
   return (
     <div className="banner">
-      <h2 className="banner__title">{winner}</h2>
+      <h2 className="banner__title">{title}</h2>
       <table className="banner__table">
         <tbody>
           <tr>

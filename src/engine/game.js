@@ -200,6 +200,21 @@ export function endRound(state) {
   return dealRound(state.roundNum + 1, newScore)
 }
 
+// The match winner, valid once phase is 'match-over'. Per the official rules, a
+// tie on total points is broken in favor of whoever scored more in the final
+// round (`state.tricksWon` still holds that round's result). Per-round point
+// totals can never tie — the two sides split 13 tricks and scoreForTricks maps
+// every such split to two different values — so this tie-break is always
+// decisive.
+export function matchWinner(state) {
+  const { human, bot } = state.score
+  if (human > bot) return HUMAN
+  if (bot > human) return BOT
+  const humanLast = scoreForTricks(state.tricksWon.human)
+  const botLast = scoreForTricks(state.tricksWon.bot)
+  return humanLast > botLast ? HUMAN : BOT
+}
+
 // Summary helper for the round-over banner.
 export function roundSummary(state) {
   return {

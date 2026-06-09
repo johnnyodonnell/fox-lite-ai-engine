@@ -142,10 +142,18 @@ fn child_mover_after(state: &State, canon: usize, mover: Player) -> Player {
 /// continues). Mirrors `State::end_round` scoring + `State::match_winner` ties,
 /// read-only (no deal, no RNG) so search never crosses a round boundary.
 fn round_over_outcome(state: &State) -> Option<Player> {
-    let nh = state.score[Player::Human.idx()] + score_for_tricks(state.tricks_won[Player::Human.idx()]);
-    let nb = state.score[Player::Bot.idx()] + score_for_tricks(state.tricks_won[Player::Bot.idx()]);
+    let hl = score_for_tricks(state.tricks_won[Player::Human.idx()]);
+    let bl = score_for_tricks(state.tricks_won[Player::Bot.idx()]);
+    let nh = state.score[Player::Human.idx()] + hl;
+    let nb = state.score[Player::Bot.idx()] + bl;
     if nh >= TARGET_SCORE || nb >= TARGET_SCORE {
-        if nh >= TARGET_SCORE && nh >= nb {
+        // Mirror `State::match_winner`: higher total wins; a tie is broken by the
+        // final round's points, which can never themselves tie.
+        if nh > nb {
+            Some(Player::Human)
+        } else if nb > nh {
+            Some(Player::Bot)
+        } else if hl > bl {
             Some(Player::Human)
         } else {
             Some(Player::Bot)

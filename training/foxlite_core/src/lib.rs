@@ -343,17 +343,29 @@ impl State {
         }
     }
 
-    /// The match winner, once `phase == MatchOver`.
+    /// The match winner, once `phase == MatchOver`. Per the official rules, a tie
+    /// on total points is broken in favor of whoever scored more in the final
+    /// round (`tricks_won` still holds that round). Per-round point totals can
+    /// never tie — the two sides split 13 tricks and `score_for_tricks` maps
+    /// every such split to two different values — so this is always decisive.
     pub fn match_winner(&self) -> Option<Player> {
         if self.phase != Phase::MatchOver {
             return None;
         }
-        if self.score[Player::Human.idx()] >= TARGET_SCORE
-            && self.score[Player::Human.idx()] >= self.score[Player::Bot.idx()]
-        {
+        let h = self.score[Player::Human.idx()];
+        let b = self.score[Player::Bot.idx()];
+        if h > b {
             Some(Player::Human)
-        } else {
+        } else if b > h {
             Some(Player::Bot)
+        } else {
+            let hl = score_for_tricks(self.tricks_won[Player::Human.idx()]);
+            let bl = score_for_tricks(self.tricks_won[Player::Bot.idx()]);
+            if hl > bl {
+                Some(Player::Human)
+            } else {
+                Some(Player::Bot)
+            }
         }
     }
 }
@@ -423,6 +435,28 @@ mod tests {
         assert_eq!(legal2.len(), 3);
         // leading -> anything
         assert_eq!(legal_moves(&hand, None).len(), 3);
+    }
+
+    #[test]
+    fn match_winner_breaks_tie_by_final_round() {
+        let mut rng = rand::thread_rng();
+        let mut s = State::new_match(&mut rng);
+        s.phase = Phase::MatchOver;
+
+        // Higher total simply wins.
+        s.score = [25, 20];
+        s.tricks_won = [0, 13];
+        assert_eq!(s.match_winner(), Some(Player::Human));
+
+        // Tie on total -> whoever scored more in the final round wins.
+        // Human took 7 tricks (6 pts) vs bot's 6 tricks (3 pts).
+        s.score = [24, 24];
+        s.tricks_won = [7, 6];
+        assert_eq!(s.match_winner(), Some(Player::Human));
+
+        // Mirror: human took 5 tricks (2 pts) vs bot's 8 tricks (6 pts).
+        s.tricks_won = [5, 8];
+        assert_eq!(s.match_winner(), Some(Player::Bot));
     }
 
     #[test]

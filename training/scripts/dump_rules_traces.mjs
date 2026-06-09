@@ -13,15 +13,9 @@ import {
   playCard,
   advanceAfterTrick,
   endRound,
+  matchWinner,
   HUMAN,
-  BOT,
 } from '../../src/engine/game.js'
-
-function matchWinner(score) {
-  // Tie-break: Human wins if human >= 21 and human >= bot, else Bot.
-  if (score.human >= 21 && score.human >= score.bot) return HUMAN
-  return BOT
-}
 
 function recordGame() {
   let state = createGame()
@@ -53,7 +47,7 @@ function recordGame() {
     rounds.push(round)
     state = after
   }
-  return { rounds, finalScore: { ...state.score }, winner: matchWinner(state.score) }
+  return { rounds, finalScore: { ...state.score }, winner: matchWinner(state) }
 }
 
 const numGames = parseInt(process.argv[2] || '300', 10)

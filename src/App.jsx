@@ -13,6 +13,7 @@ import {
   createGame,
   endRound,
   legalMoves,
+  matchWinner,
   playCard,
   roundSummary,
 } from './engine/game.js'
@@ -151,6 +152,7 @@ export default function App() {
         <RoundBanner
           type="match"
           score={state.score}
+          winner={matchWinner(state)}
           onContinue={handleNewMatch}
         />
       )}
