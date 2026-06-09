@@ -125,8 +125,14 @@ fn main() {
             };
             pipeline::run(cfg);
         }
+        "selfplay-serve" => {
+            // Persistent worker: CUDA/libtorch init once, then one cohort per
+            // stdin command. The orchestrator drives it (see orchestrator.py).
+            let dev = pipeline::pick_device(args.iter().any(|a| a == "--cpu"));
+            pipeline::serve(dev);
+        }
         other => {
-            eprintln!("unknown subcommand {other:?}; expected: forward-check | selfplay | selfplay-pipe");
+            eprintln!("unknown subcommand {other:?}; expected: forward-check | selfplay | selfplay-pipe | selfplay-serve");
             std::process::exit(2);
         }
     }

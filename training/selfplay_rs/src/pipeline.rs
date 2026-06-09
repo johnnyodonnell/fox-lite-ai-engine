@@ -385,17 +385,97 @@ fn scatter_loop(shared: Arc<Shared>, work_rx: Receiver<WorkItem>) {
     }
 }
 
-pub fn run(cfg: Config) {
-    let dev = if cfg.cpu {
+/// Pick the self-play device (CUDA if available, unless `--cpu`).
+pub fn pick_device(cpu: bool) -> Device {
+    if cpu {
         Device::Cpu
     } else if tch::Cuda::is_available() {
         Device::Cuda(0)
     } else {
         eprintln!("warning: CUDA unavailable, self-play on CPU");
         Device::Cpu
-    };
-    let net = Net::load(&cfg.weights, dev, Kind::Float);
+    }
+}
 
+pub fn run(cfg: Config) {
+    let dev = pick_device(cfg.cpu);
+    let net = Net::load(&cfg.weights, dev, Kind::Float);
+    run_with_net(&cfg, &net, dev);
+}
+
+/// Persistent worker: initialize CUDA/libtorch once, then run one cohort per
+/// newline-delimited JSON command on stdin (`{weights,out,matches,batch,
+/// concurrency,threads,slots,temperature,seed}`, plus optional `quit`). Reloads
+/// weights per command (a few ms for this net) and acks each cohort with a
+/// `{"done":true}` line — the cohort itself is handed off via the `out` file.
+pub fn serve(dev: Device) {
+    use std::io::{BufRead, Write};
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    println!("{}", serde_json::json!({"ready": true}));
+    stdout.flush().expect("flush ready");
+
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break, // stdin closed -> shut down
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cmd: ServeCmd = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("bad serve command {line:?}: {e}"));
+        if cmd.quit {
+            break;
+        }
+        let cfg = cmd.into_config();
+        // Reload weights each cohort: the orchestrator rewrites the same path
+        // (serving_weights.safetensors) every iteration, so a path cache would miss.
+        let net = Net::load(&cfg.weights, dev, Kind::Float);
+        run_with_net(&cfg, &net, dev);
+        println!("{}", serde_json::json!({"done": true}));
+        stdout.flush().expect("flush done");
+    }
+}
+
+/// One self-play command from the orchestrator (mirrors `Config`'s knobs).
+#[derive(serde::Deserialize)]
+struct ServeCmd {
+    weights: String,
+    out: String,
+    matches: usize,
+    batch: usize,
+    concurrency: usize,
+    threads: usize,
+    slots: usize,
+    temperature: f64,
+    seed: u64,
+    #[serde(default)]
+    cpu: bool,
+    #[serde(default)]
+    quit: bool,
+}
+
+impl ServeCmd {
+    fn into_config(self) -> Config {
+        Config {
+            weights: self.weights,
+            out: self.out,
+            matches: self.matches,
+            batch: self.batch,
+            concurrency: self.concurrency,
+            n_threads: self.threads,
+            slots: self.slots,
+            temperature: self.temperature,
+            seed: self.seed,
+            cpu: self.cpu,
+        }
+    }
+}
+
+/// Generate one cohort with an already-loaded net (shared by `run` and `serve`).
+fn run_with_net(cfg: &Config, net: &Net, dev: Device) {
     let batch = cfg.batch.max(1).min(cfg.matches.max(1));
     let concurrency = cfg.concurrency.max(batch).min(cfg.matches.max(1));
     let n_threads = cfg.n_threads.max(1);
@@ -439,7 +519,7 @@ pub fn run(cfg: Config) {
 
     // Inference runs on this thread (owns the net / GPU). On shutdown it returns
     // and drops `work_tx`, which drains and ends the scatter thread.
-    inference_loop(shared.clone(), &net, dev, batch, work_tx);
+    inference_loop(shared.clone(), net, dev, batch, work_tx);
     scatter.join().expect("scatter thread panicked");
 
     // Merge the per-worker cohort buffers (concatenated; row order is arbitrary,

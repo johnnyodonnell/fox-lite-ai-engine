@@ -53,6 +53,32 @@ def worker_env() -> dict:
     return env
 
 
+def start_selfplay_worker(env):
+    """Spawn the persistent `selfplay-serve` worker (CUDA/libtorch init once) and
+    block until it reports ready. Returns the Popen handle."""
+    p = subprocess.Popen(
+        [str(SELFPLAY_BIN), "selfplay-serve"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        cwd=str(HERE), env=env, text=True, bufsize=1,
+    )
+    line = p.stdout.readline()
+    if not line or not json.loads(line).get("ready"):
+        raise RuntimeError(f"selfplay worker failed to start (got {line!r})")
+    return p
+
+
+def run_cohort(worker, **cmd):
+    """Send one cohort command to the worker and block until it writes the cohort
+    file and acks `done`. Raises if the worker died (empty read / broken pipe)."""
+    worker.stdin.write(json.dumps(cmd) + "\n")
+    worker.stdin.flush()
+    line = worker.stdout.readline()
+    if not line:
+        raise RuntimeError("selfplay worker died")
+    if not json.loads(line).get("done"):
+        raise RuntimeError(f"selfplay worker bad ack: {line!r}")
+
+
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default="runs/run1")
@@ -174,23 +200,35 @@ def main():
             print(f"[eval] failed (exit {e.returncode})", flush=True)
 
     env = worker_env()
+    concurrency = args.selfplay_concurrency or 2 * args.selfplay_batch
+    worker = start_selfplay_worker(env)
+
+    def selfplay(seed):
+        """One cohort via the persistent worker. On worker death, respawn and
+        retry once so a crash degrades to fork-per-cohort rather than killing
+        the daemon."""
+        nonlocal worker
+        cmd = dict(
+            weights=str(serving_st), out=str(cohort_path),
+            matches=args.matches, batch=args.selfplay_batch,
+            concurrency=concurrency, threads=args.selfplay_threads,
+            slots=args.selfplay_slots, temperature=args.temperature, seed=seed,
+        )
+        try:
+            run_cohort(worker, **cmd)
+        except (RuntimeError, BrokenPipeError, ValueError) as e:
+            print(f"[selfplay] worker error ({e}); respawning", flush=True)
+            try:
+                worker.kill()
+            except ProcessLookupError:
+                pass
+            worker = start_selfplay_worker(env)
+            run_cohort(worker, **cmd)
+
     while True:
         t0 = time.time()
         seed = args.seed + total_cohorts * 7919 + 1
-        concurrency = args.selfplay_concurrency or 2 * args.selfplay_batch
-        subprocess.run(
-            [str(SELFPLAY_BIN), "selfplay-pipe",
-             "--weights", str(serving_st),
-             "--out", str(cohort_path),
-             "--matches", str(args.matches),
-             "--batch", str(args.selfplay_batch),
-             "--concurrency", str(concurrency),
-             "--threads", str(args.selfplay_threads),
-             "--slots", str(args.selfplay_slots),
-             "--temperature", str(args.temperature),
-             "--seed", str(seed)],
-            cwd=str(HERE), env=env, check=True,
-        )
+        selfplay(seed)
         sp_sec = time.time() - t0
 
         cohort = read_cohort(str(cohort_path))
