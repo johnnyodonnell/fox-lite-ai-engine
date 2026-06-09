@@ -24,7 +24,7 @@ fi
 
 exec python orchestrator.py \
   --out-dir "${OUT_DIR:-runs/run2}" \
-  --snapshot-every "${SNAPSHOT_EVERY:-30m}" \
+  --snapshot-every "${SNAPSHOT_EVERY:-4h}" \
   --sims "${SIMS:-200}" \
   --threads "${THREADS:-16}" \
   --slots "${SLOTS:-2}" \
