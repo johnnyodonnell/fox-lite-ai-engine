@@ -38,17 +38,20 @@ use crate::{
 pub const C_PUCT: f64 = 1.5;
 pub const DIRICHLET_ALPHA: f64 = 0.6; // higher than chess's 0.3 for Fox-Lite's ≤13 branching
 pub const DIRICHLET_EPS: f64 = 0.25;
-pub const TEMP_EARLY: f64 = 1.0; // sampling temperature for the opening tricks of a round
-pub const TEMP_LATE: f64 = 0.25; // annealed temperature once past the opening
-pub const TEMP_EARLY_TRICKS: u32 = 4;
+pub const TEMP_OPENING: f64 = 1.0; // sampling temperature for the opening tricks of a round
+pub const TEMP_FLOOR: f64 = 0.25; // floor temperature once fully annealed
+pub const TEMP_EARLY_TRICKS: u32 = 4; // tricks held at the opening temperature
+pub const TEMP_ANNEAL_TRICKS: u32 = 9; // tricks over which temperature ramps to the floor
 
 /// Self-play move-selection temperature for a state in trick `trick_num` (1..13).
+/// Holds at `TEMP_OPENING` for the first `TEMP_EARLY_TRICKS` tricks, then linearly
+/// anneals to `TEMP_FLOOR` over the following `TEMP_ANNEAL_TRICKS` tricks.
 pub fn temperature(trick_num: u32) -> f64 {
     if trick_num <= TEMP_EARLY_TRICKS {
-        TEMP_EARLY
-    } else {
-        TEMP_LATE
+        return TEMP_OPENING;
     }
+    let frac = (((trick_num - TEMP_EARLY_TRICKS) as f64) / TEMP_ANNEAL_TRICKS as f64).min(1.0);
+    TEMP_OPENING + frac * (TEMP_FLOOR - TEMP_OPENING)
 }
 
 pub struct Node {
