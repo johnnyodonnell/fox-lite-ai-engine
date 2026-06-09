@@ -16,16 +16,16 @@ export default function RoundBanner({ type, summary, score, winner, onContinue }
           </thead>
           <tbody>
             <tr>
-              <th>You</th>
-              <td>{summary.human.tricks}</td>
-              <td>+{summary.human.points}</td>
-              <td>{score.human + summary.human.points}</td>
-            </tr>
-            <tr>
               <th>Bot</th>
               <td>{summary.bot.tricks}</td>
               <td>+{summary.bot.points}</td>
               <td>{score.bot + summary.bot.points}</td>
+            </tr>
+            <tr>
+              <th>You</th>
+              <td>{summary.human.tricks}</td>
+              <td>+{summary.human.points}</td>
+              <td>{score.human + summary.human.points}</td>
             </tr>
           </tbody>
         </table>
