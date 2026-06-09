@@ -340,6 +340,7 @@ def main():
                     "loss": round(float(np.mean([l["loss"] for l in losses])), 4),
                     "policy": round(float(np.mean([l["policy_loss"] for l in losses])), 4),
                     "value": round(float(np.mean([l["value_loss"] for l in losses])), 4),
+                    "entropy": round(float(np.mean([l["target_entropy"] for l in losses])), 4),
                 }
             elif not got_any:
                 time.sleep(0.05)

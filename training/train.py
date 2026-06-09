@@ -49,6 +49,9 @@ def train_step(net, opt, batch, device, *, grad_clip=1.0):
     logits, v = net(s)
     log_probs = F.log_softmax(logits, dim=1)
     policy_loss = -(pi * log_probs).sum(dim=1).mean()
+    # H(pi): entropy of the ISMCTS target = irreducible floor of policy_loss.
+    # policy_loss - target_entropy == KL(pi || p_net), the reducible fit error.
+    target_entropy = -(pi * pi.clamp_min(1e-9).log()).sum(dim=1).mean()
     value_loss = F.mse_loss(v, z)
     loss = policy_loss + value_loss
 
@@ -62,4 +65,5 @@ def train_step(net, opt, batch, device, *, grad_clip=1.0):
         "loss": float(loss.item()),
         "policy_loss": float(policy_loss.item()),
         "value_loss": float(value_loss.item()),
+        "target_entropy": float(target_entropy.item()),
     }
