@@ -28,7 +28,7 @@ exec python orchestrator.py \
   --sims "${SIMS:-200}" \
   --threads "${THREADS:-16}" \
   --slots "${SLOTS:-2}" \
-  --selfplay-batch "${SELFPLAY_BATCH:-512}" \
+  --selfplay-batch "${SELFPLAY_BATCH:-2048}" \
   --batch-size "${BATCH_SIZE:-256}" \
   --lr "${LR:-2e-3}" \
   --eval-games "${EVAL_GAMES:-200}" \

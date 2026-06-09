@@ -118,10 +118,12 @@ fn main() {
             // Throughput probe (no trainer): prints games/sec + rows/sec.
             let run = flag(&args, "--run-secs", "60").parse().unwrap();
             let interval = flag(&args, "--interval-secs", "10").parse().unwrap();
+            let warmup = flag(&args, "--warmup-secs", "90").parse().unwrap();
             pipeline::run_bench(
                 parse_pipeline_config(&args),
                 Duration::from_secs_f64(run),
                 Duration::from_secs_f64(interval),
+                Duration::from_secs_f64(warmup),
             );
         }
         other => {

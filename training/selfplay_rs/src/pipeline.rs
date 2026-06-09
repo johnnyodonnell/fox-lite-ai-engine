@@ -594,19 +594,32 @@ pub fn run_serve(config: Config) {
 }
 
 /// Bench mode: run for `run`, printing games/sec + rows/sec every `interval`.
-pub fn run_bench(config: Config, run: Duration, interval: Duration) {
+///
+/// Self-play starts as a synchronized cohort (all games begin near t=0 and finish
+/// in waves), so per-interval rates oscillate wildly for the first minute. We
+/// discard the first `warmup` and report a single cumulative average over the
+/// remaining measure window — that's the number to compare across batch sizes.
+pub fn run_bench(config: Config, run: Duration, interval: Duration, warmup: Duration) {
     let sims = config.sims;
     let (nt, ns, nb) = (config.n_threads, config.n_slots, config.batch);
     let shared = make_shared(config);
     let sink: Arc<dyn Fn(Vec<Row>) + Send + Sync> = Arc::new(|_rows: Vec<Row>| {});
     let pipeline = spawn_pipeline(shared.clone(), sink);
 
-    println!("selfplay_rs bench: batch={nb} threads={nt} slots={ns} sims={sims}");
+    println!("selfplay_rs bench: batch={nb} threads={nt} slots={ns} sims={sims} warmup={:.0}s", warmup.as_secs_f64());
     let start = Instant::now();
     let mut win_start = start;
     let (mut last_g, mut last_r) = (0u64, 0u64);
+    // Counters/clock at the end of warmup, for the cumulative steady-state average.
+    let mut measure_start: Option<Instant> = None;
+    let (mut base_g, mut base_r) = (0u64, 0u64);
     while start.elapsed() < run {
         thread::sleep(Duration::from_millis(200));
+        if measure_start.is_none() && start.elapsed() >= warmup {
+            measure_start = Some(Instant::now());
+            base_g = shared.games_done.load(AtomicOrdering::Relaxed);
+            base_r = shared.rows_done.load(AtomicOrdering::Relaxed);
+        }
         if win_start.elapsed() >= interval {
             let dt = win_start.elapsed().as_secs_f64();
             let g = shared.games_done.load(AtomicOrdering::Relaxed);
@@ -623,6 +636,21 @@ pub fn run_bench(config: Config, run: Duration, interval: Duration) {
             win_start = Instant::now();
         }
     }
+    let g = shared.games_done.load(AtomicOrdering::Relaxed);
+    let r = shared.rows_done.load(AtomicOrdering::Relaxed);
     shutdown(&shared, pipeline);
-    println!("DONE (read steady-state from the last few intervals)");
+    match measure_start {
+        Some(t0) => {
+            let dt = t0.elapsed().as_secs_f64();
+            println!(
+                "STEADY batch={nb}: {:7.3} games/sec  ({:5.1} rows/game, {:6.0} rows/sec) over {:.0}s after {:.0}s warmup",
+                (g - base_g) as f64 / dt,
+                (r - base_r) as f64 / (g - base_g).max(1) as f64,
+                (r - base_r) as f64 / dt,
+                dt,
+                warmup.as_secs_f64(),
+            );
+        }
+        None => println!("STEADY batch={nb}: run shorter than warmup; no measurement"),
+    }
 }
