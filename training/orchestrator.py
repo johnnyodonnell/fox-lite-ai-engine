@@ -60,6 +60,26 @@ def worker_env() -> dict:
     return env
 
 
+def _pid_alive(pid: int) -> bool:
+    """True if `pid` is a live (non-zombie) process. A finished-but-unreaped
+    detached eval lingers as a zombie whose PID still answers kill(0); treat
+    those as dead so a stale lock never blocks every future eval."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+        if data[data.rindex(")") + 1:].split()[0] == "Z":
+            return False
+    except (OSError, ValueError, IndexError):
+        pass
+    return True
+
+
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default="runs/run2")
@@ -67,7 +87,7 @@ def parse_args():
                     help="Warm-start a fresh run from a .pt checkpoint or a raw "
                          ".safetensors snapshot (weights only; fresh clock). Only "
                          "used on cold start (ignored once latest.pt exists).")
-    ap.add_argument("--snapshot-every", default="4h")
+    ap.add_argument("--snapshot-every", default="30m")
     ap.add_argument("--save-latest-every", default="300s")
     ap.add_argument("--publish-every", default="15s",
                     help="How often to republish serving_weights.safetensors "
@@ -92,8 +112,10 @@ def parse_args():
     ap.add_argument("--log-every", type=float, default=30.0)
     # evaluation (ISMCTS)
     ap.add_argument("--no-eval", action="store_true")
-    ap.add_argument("--eval-games", type=int, default=80, help="matches per opponent")
-    ap.add_argument("--eval-sims", type=int, default=400)
+    ap.add_argument("--eval-games", type=int, default=30, help="matches per opponent")
+    ap.add_argument("--eval-sims", type=int, default=100,
+                    help="ISMCTS eval is synchronous (batch-1), so keep this well "
+                         "below self-play --sims to fit inside the snapshot interval")
     ap.add_argument("--n-top", type=int, default=2)
     ap.add_argument("--n-anchors", type=int, default=3)
     return ap.parse_args()
@@ -177,6 +199,16 @@ def main():
     def launch_eval(st_path):
         if args.no_eval or not EVAL_BIN.exists():
             return
+        # Skip if a prior eval is still running (ISMCTS eval can outlast a short
+        # snapshot interval; piling up evals would thrash the GPU vs self-play).
+        lock = out_dir / "eval.lock"
+        if lock.exists():
+            try:
+                if _pid_alive(int(lock.read_text().split()[0])):
+                    print(f"[eval] prior eval still running; skipping {st_path.name}", flush=True)
+                    return
+            except (ValueError, IndexError, OSError):
+                pass
         logf = open(out_dir / "eval.log", "a")
         try:
             proc = subprocess.Popen(
@@ -189,6 +221,7 @@ def main():
             )
         finally:
             logf.close()
+        (out_dir / "eval.lock").write_text(f"{proc.pid} {time.time()}")
         print(f"[eval] launched evaluate_rs pid={proc.pid} for {st_path.name}", flush=True)
 
     # ----- Spawn the Rust self-play worker + a reader thread -----
