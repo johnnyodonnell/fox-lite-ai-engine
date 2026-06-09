@@ -31,7 +31,7 @@ exec python orchestrator.py \
   --selfplay-batch "${SELFPLAY_BATCH:-512}" \
   --batch-size "${BATCH_SIZE:-256}" \
   --lr "${LR:-2e-3}" \
-  --eval-games "${EVAL_GAMES:-100}" \
+  --eval-games "${EVAL_GAMES:-200}" \
   --eval-sims "${EVAL_SIMS:-200}" \
   --seed "${SEED:-42}" \
   "${INIT_ARGS[@]}"

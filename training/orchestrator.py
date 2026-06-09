@@ -112,7 +112,7 @@ def parse_args():
     ap.add_argument("--log-every", type=float, default=30.0)
     # evaluation (ISMCTS)
     ap.add_argument("--no-eval", action="store_true")
-    ap.add_argument("--eval-games", type=int, default=100, help="matches per opponent")
+    ap.add_argument("--eval-games", type=int, default=200, help="matches per opponent")
     ap.add_argument("--eval-sims", type=int, default=200,
                     help="ISMCTS eval is synchronous (batch-1); at a full opponent "
                          "pool an eval can outlast the snapshot interval, in which "
