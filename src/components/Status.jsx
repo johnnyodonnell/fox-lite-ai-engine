@@ -1,7 +1,6 @@
 export default function Status({
   message,
   roundNum,
-  trickNum,
   humanScore,
   botScore,
 }) {
@@ -10,7 +9,6 @@ export default function Status({
       <div className="status__message">{message}</div>
       <div className="status__row">
         <span className="status__chip">Round {roundNum}</span>
-        <span className="status__chip">Trick {trickNum}/13</span>
         <span className="status__chip status__chip--score">
           Match — You {humanScore} · Bot {botScore}
         </span>

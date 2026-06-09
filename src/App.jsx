@@ -117,7 +117,6 @@ export default function App() {
       <Status
         message={statusMessage(state)}
         roundNum={state.roundNum}
-        trickNum={Math.min(state.trickNum, 13)}
         humanScore={state.score.human}
         botScore={state.score.bot}
       />
