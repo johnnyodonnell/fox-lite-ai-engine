@@ -1,4 +1,7 @@
 
 - Feature ideas
     - Include the full hand history as input into the NN model
+    - Train with different model architectures (AWR or NFSP) and see
+        if we can outperform our current model
+    - Train with ISMCTS to see if we can outperform our current model
 
