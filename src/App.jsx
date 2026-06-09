@@ -118,8 +118,6 @@ export default function App() {
         message={statusMessage(state)}
         roundNum={state.roundNum}
         trickNum={Math.min(state.trickNum, 13)}
-        humanTricks={state.tricksWon.human}
-        botTricks={state.tricksWon.bot}
         humanScore={state.score.human}
         botScore={state.score.bot}
       />
@@ -129,7 +127,13 @@ export default function App() {
       <div className="table-area">
         <Trump card={state.trump} />
         <div className="table">
+          <div className="table__tricks table__tricks--top">
+            Bot tricks: {state.tricksWon.bot}
+          </div>
           <Trick {...trickDisplay} />
+          <div className="table__tricks table__tricks--bottom">
+            Your tricks: {state.tricksWon.human}
+          </div>
         </div>
       </div>
 
