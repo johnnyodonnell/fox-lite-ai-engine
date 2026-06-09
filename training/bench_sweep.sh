@@ -12,7 +12,7 @@ source .venv/bin/activate
 export LD_LIBRARY_PATH="$(python -c 'import os,glob,torch; tl=os.path.join(os.path.dirname(torch.__file__),"lib"); sp=os.path.dirname(os.path.dirname(torch.__file__)); print(":".join([tl]+sorted(glob.glob(os.path.join(sp,"nvidia","*","lib")))))'):${LD_LIBRARY_PATH:-}"
 
 BIN="$DIR/selfplay_rs/target/release/selfplay_rs"
-WEIGHTS="${WEIGHTS:-/home/johnny/Workspace/fox-lite/runs/run2/serving_weights.safetensors}"
+WEIGHTS="${WEIGHTS:-/home/johnny/Workspace/fox-lite/runs/run3/serving_weights.safetensors}"
 THREADS="${THREADS:-16}"
 SLOTS="${SLOTS:-2}"
 SIMS="${SIMS:-200}"

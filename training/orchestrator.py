@@ -82,7 +82,7 @@ def _pid_alive(pid: int) -> bool:
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", default="runs/run2")
+    ap.add_argument("--out-dir", default="runs/run3")
     ap.add_argument("--init-from", default=None,
                     help="Warm-start a fresh run from a .pt checkpoint or a raw "
                          ".safetensors snapshot (weights only; fresh clock). Only "

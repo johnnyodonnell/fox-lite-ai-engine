@@ -9,7 +9,7 @@
 //! manual (training/promote.py). Net agents play by ISMCTS search (`--sims`
 //! simulations, root noise off, argmax-visit move); `random` is the floor anchor.
 //!
-//!   evaluate_rs --run-dir runs/run2 --candidate runs/run2/snapshots/snap_x.safetensors
+//!   evaluate_rs --run-dir runs/run3 --candidate runs/run3/snapshots/snap_x.safetensors
 //!               [--games 80] [--sims 400] [--n-top 2] [--n-anchors 3] [--seed 0]
 //!
 //! stdout: human-readable `[eval]` logs (opponents, per-pair results, ratings).

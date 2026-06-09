@@ -2,7 +2,7 @@
 # pm2 entrypoint for indefinite ISMCTS self-play training (continuous AlphaZero
 # loop: streaming self-play -> replay buffer -> paced SGD, 4h snapshots + eval).
 #
-#   OUT_DIR=.../runs/run2 INIT_FROM=.../runs/run1/snapshots/snap_h00019_*.safetensors \
+#   OUT_DIR=.../runs/run3 INIT_FROM=.../runs/run1/snapshots/snap_h00019_*.safetensors \
 #     pm2 start training/run_daemon.sh --name fox-train --kill-timeout 20000
 #
 # Resumes from <OUT_DIR>/latest.pt if present. INIT_FROM warm-starts a fresh run
@@ -23,7 +23,7 @@ if [[ -n "${INIT_FROM:-}" ]]; then
 fi
 
 exec python orchestrator.py \
-  --out-dir "${OUT_DIR:-runs/run2}" \
+  --out-dir "${OUT_DIR:-runs/run3}" \
   --snapshot-every "${SNAPSHOT_EVERY:-4h}" \
   --sims "${SIMS:-200}" \
   --threads "${THREADS:-16}" \

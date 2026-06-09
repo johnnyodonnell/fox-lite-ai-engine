@@ -56,27 +56,27 @@ run from the best prior snapshot with `INIT_FROM` (a `.pt` or raw `.safetensors`
 ignored once `latest.pt` exists):
 
 ```sh
-OUT_DIR=$PWD/runs/run2 \
+OUT_DIR=$PWD/runs/run3 \
 INIT_FROM=$PWD/runs/run1/snapshots/snap_h00019_20260608T160917Z.safetensors \
 SIMS=400 \
   pm2 start training/run_daemon.sh --name fox-train --kill-timeout 20000
 ```
 
-Resumes from `runs/run2/latest.pt`. The trainer streams finished games from the
+Resumes from `runs/run3/latest.pt`. The trainer streams finished games from the
 Rust worker into a ring replay buffer and runs SGD paced to the data rate
 (`--target-reuse`). Watch progress:
 
 ```sh
 pm2 logs fox-train             # JSON lines: games/buf/tr_steps/loss{policy,value}
-cat  runs/run2/pool.json       # models + ratings + match results + top list
-cat  runs/run2/eval.log        # detached evaluate_rs [eval] lines
+cat  runs/run3/pool.json       # models + ratings + match results + top list
+cat  runs/run3/eval.log        # detached evaluate_rs [eval] lines
 ```
 
 Quick self-play throughput probe (no trainer):
 
 ```sh
 ./selfplay_rs/target/release/selfplay_rs bench \
-  --weights runs/run2/serving_weights.safetensors --sims 400 --threads 16 --batch 512
+  --weights runs/run3/serving_weights.safetensors --sims 400 --threads 16 --batch 512
 ```
 
 Each snapshot is evaluated by `evaluate_rs` (now via ISMCTS, `--sims`): it picks
@@ -88,7 +88,7 @@ refits a global Bradley-Terry Elo over all accumulated results (random pinned at
 ## Promote a model to the browser (manual)
 
 ```sh
-python promote.py --snapshot runs/run2/snapshots/snap_XXXX.safetensors --out /tmp/current.onnx
+python promote.py --snapshot runs/run3/snapshots/snap_XXXX.safetensors --out /tmp/current.onnx
 # then, on the web-app host:
 scp asus-nvidia:/tmp/current.onnx public/models/current.onnx   # and commit
 ```
