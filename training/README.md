@@ -1,25 +1,33 @@
 # Fox-Lite self-play training
 
-Search-free **REINFORCE** self-play for the Fox-in-the-Forest-Lite engine. 100%
-Rust self-play + evaluator (`tch`/libtorch on GPU), Python trainer, strict-
-synchronous loop, 30-minute snapshots. The deployed browser engine
-(`src/engine/neural.js`) runs the exported ONNX with a single forward pass — no
-search.
+**AlphaZero-style ISMCTS** self-play for the Fox-in-the-Forest-Lite engine. 100%
+Rust self-play + evaluator (`tch`/libtorch on GPU), Python trainer, continuous
+streaming loop (self-play → replay buffer → paced SGD), 4-hour snapshots.
+
+Self-play picks moves by **Information-Set MCTS**: PUCT with the policy head as
+prior and the value head at the leaves, re-determinizing the hidden cards
+(opponent hand + unused pile) every simulation (true ISMCTS). The search-improved
+root visit distribution becomes the policy target; the match outcome `z=±1` is the
+value target. The deployed browser engine (`src/engine/neural.js`) still runs the
+exported ONNX with a **single forward pass — no search**; evaluation, by contrast,
+uses ISMCTS.
 
 ## Layout
 
 ```
-foxlite_core/     Rust crate: Lite rules (port of src/engine/game.js) + canonical encoder
-selfplay_rs/      Rust: self-play worker (selfplay_rs) + evaluator (evaluate_rs), tch forward
-net.py            PyTorch residual MLP (policy + value)
+foxlite_core/     Rust crate: Lite rules + canonical encoder
+  src/determinize.rs  ISMCTS determinization (sample a hidden world from an info set)
+  src/mcts.rs         ISMCTS primitives: availability-PUCT, seat-aware backprop, run_search
+selfplay_rs/      Rust: self-play worker (selfplay_rs `serve`/`bench`) + evaluator (evaluate_rs)
+  src/pipeline.rs     continuous leaf-batched ISMCTS pipeline (tch fp32 forward, frame stream)
+net.py            PyTorch residual MLP (policy + value) — unchanged arch
 encode.py         canonical encoder (parity reference)
-train.py          REINFORCE update (advantage = z - V; + value MSE + entropy bonus)
-orchestrator.py   strict-sync loop: selfplay -> train -> publish -> (snapshot + eval)
+train.py          AlphaZero update: ReplayBuffer + CE(pi, visits) + MSE(v, z)
+orchestrator.py   continuous loop: stream games -> replay buffer -> paced SGD -> (snapshot + eval)
 export.py         self-contained ONNX export + safetensors I/O
 promote.py        snapshot .safetensors -> browser ONNX
-cohort.py         read/verify a self-play cohort file
 elo.py            legacy one-shot Elo fit (superseded by evaluate_rs's global refit)
-runs/             (gitignored) weights, snapshots/, cohort, pool.json
+runs/             (gitignored) weights, snapshots/, serving_weights.safetensors, pool.json
 ```
 
 ## Setup (asus-nvidia / GB10)
@@ -43,27 +51,44 @@ is the project interpreter.
 
 ## Train
 
-```sh
-OUT_DIR=runs/run1 nohup ./run_daemon.sh > runs/run1.log 2>&1 &
-```
-
-Resumes from `runs/run1/latest.pt`. Watch progress + the Elo curve:
+Managed by pm2 (`fox-train`). Env vars drive `run_daemon.sh`; warm-start a fresh
+run from the best prior snapshot with `INIT_FROM` (a `.pt` or raw `.safetensors`,
+ignored once `latest.pt` exists):
 
 ```sh
-tail -f runs/run1.log          # per-cohort loss/entropy/value + [eval] elo lines
-cat  runs/run1/pool.json       # models + ratings + match results + top list
+OUT_DIR=$PWD/runs/run2 \
+INIT_FROM=$PWD/runs/run1/snapshots/snap_h00019_20260608T160917Z.safetensors \
+SIMS=400 \
+  pm2 start training/run_daemon.sh --name fox-train --kill-timeout 20000
 ```
 
-Each snapshot is evaluated by `evaluate_rs`: it picks an active opponent set
-(top-`--n-top` rated + `random` + `--n-anchors` frozen snapshots spread across
-the Elo range), plays `--eval-games` per opponent, then refits a global
-Bradley-Terry Elo over all accumulated results (random pinned at 0) into
-`pool.json`. Promotion to the browser model stays manual (see below).
+Resumes from `runs/run2/latest.pt`. The trainer streams finished games from the
+Rust worker into a ring replay buffer and runs SGD paced to the data rate
+(`--target-reuse`). Watch progress:
+
+```sh
+pm2 logs fox-train             # JSON lines: games/buf/tr_steps/loss{policy,value}
+cat  runs/run2/pool.json       # models + ratings + match results + top list
+cat  runs/run2/eval.log        # detached evaluate_rs [eval] lines
+```
+
+Quick self-play throughput probe (no trainer):
+
+```sh
+./selfplay_rs/target/release/selfplay_rs bench \
+  --weights runs/run2/serving_weights.safetensors --sims 400 --threads 16 --batch 512
+```
+
+Each snapshot is evaluated by `evaluate_rs` (now via ISMCTS, `--sims`): it picks
+an active opponent set (top-`--n-top` rated + `random` + `--n-anchors` frozen
+snapshots spread across the Elo range), plays `--eval-games` per opponent, then
+refits a global Bradley-Terry Elo over all accumulated results (random pinned at
+0) into `pool.json`. Promotion to the browser model stays manual (see below).
 
 ## Promote a model to the browser (manual)
 
 ```sh
-python promote.py --snapshot runs/run1/snapshots/snap_XXXX.safetensors --out /tmp/current.onnx
+python promote.py --snapshot runs/run2/snapshots/snap_XXXX.safetensors --out /tmp/current.onnx
 # then, on the web-app host:
 scp asus-nvidia:/tmp/current.onnx public/models/current.onnx   # and commit
 ```

@@ -3,4 +3,3 @@
 pub mod cuda_event;
 pub mod net;
 pub mod pipeline;
-pub mod selfplay;

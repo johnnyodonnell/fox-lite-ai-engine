@@ -5,12 +5,12 @@
 //!                         (fwd_weights.safetensors + fwd_fixture.safetensors in <dir>)
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use tch::{Device, Kind, Tensor};
 
 use selfplay_rs::net::Net;
 use selfplay_rs::pipeline;
-use selfplay_rs::selfplay;
 
 /// Read a `--key value` flag, falling back to `default`.
 fn flag(args: &[String], key: &str, default: &str) -> String {
@@ -19,6 +19,21 @@ fn flag(args: &[String], key: &str, default: &str) -> String {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_else(|| default.to_string())
+}
+
+/// Shared CLI parsing for the `serve` and `bench` self-play subcommands.
+fn parse_pipeline_config(args: &[String]) -> pipeline::Config {
+    pipeline::Config {
+        sims: flag(args, "--sims", "400").parse().unwrap(),
+        add_root_noise: !args.iter().any(|a| a == "--no-noise"),
+        seed: flag(args, "--seed", "0").parse().unwrap(),
+        n_threads: flag(args, "--threads", "16").parse().unwrap(),
+        n_slots: flag(args, "--slots", "2").parse().unwrap(),
+        batch: flag(args, "--batch", "512").parse().unwrap(),
+        weights_path: flag(args, "--weights", "serving_weights.safetensors"),
+        reload_every: Duration::from_millis(flag(args, "--reload-ms", "2000").parse().unwrap()),
+        cpu: args.iter().any(|a| a == "--cpu"),
+    }
 }
 
 fn read_fixture(path: &str) -> HashMap<String, Tensor> {
@@ -94,45 +109,23 @@ fn main() {
             println!("{}", if ok { "FORWARD-CHECK OK" } else { "FORWARD-CHECK FAILED" });
             std::process::exit(if ok { 0 } else { 1 });
         }
-        "selfplay" => {
-            let cfg = selfplay::Config {
-                weights: flag(&args, "--weights", "weights.safetensors"),
-                out: flag(&args, "--out", "cohort.bin"),
-                matches: flag(&args, "--matches", "1024").parse().unwrap(),
-                batch: flag(&args, "--batch", "512").parse().unwrap(),
-                temperature: flag(&args, "--temperature", "1.0").parse().unwrap(),
-                seed: flag(&args, "--seed", "0").parse().unwrap(),
-                cpu: args.iter().any(|a| a == "--cpu"),
-            };
-            selfplay::run(cfg);
+        "serve" => {
+            // Continuous ISMCTS self-play worker: streams finished games as framed
+            // bytes on stdout for the orchestrator; shuts down on stdin EOF.
+            pipeline::run_serve(parse_pipeline_config(&args));
         }
-        "selfplay-pipe" => {
-            let batch: usize = flag(&args, "--batch", "512").parse().unwrap();
-            let cfg = pipeline::Config {
-                weights: flag(&args, "--weights", "weights.safetensors"),
-                out: flag(&args, "--out", "cohort.bin"),
-                matches: flag(&args, "--matches", "1024").parse().unwrap(),
-                batch,
-                // default concurrency = 2x batch (overlaps CPU game logic with the GPU forward)
-                concurrency: flag(&args, "--concurrency", &(2 * batch).to_string()).parse().unwrap(),
-                n_threads: flag(&args, "--threads", "8").parse().unwrap(),
-                // forwards in flight: inference can run this many forwards ahead of the
-                // scatter thread's readback (2 = double-buffer; keeps the GPU fed).
-                slots: flag(&args, "--slots", "2").parse().unwrap(),
-                temperature: flag(&args, "--temperature", "1.0").parse().unwrap(),
-                seed: flag(&args, "--seed", "0").parse().unwrap(),
-                cpu: args.iter().any(|a| a == "--cpu"),
-            };
-            pipeline::run(cfg);
-        }
-        "selfplay-serve" => {
-            // Persistent worker: CUDA/libtorch init once, then one cohort per
-            // stdin command. The orchestrator drives it (see orchestrator.py).
-            let dev = pipeline::pick_device(args.iter().any(|a| a == "--cpu"));
-            pipeline::serve(dev);
+        "bench" => {
+            // Throughput probe (no trainer): prints games/sec + rows/sec.
+            let run = flag(&args, "--run-secs", "60").parse().unwrap();
+            let interval = flag(&args, "--interval-secs", "10").parse().unwrap();
+            pipeline::run_bench(
+                parse_pipeline_config(&args),
+                Duration::from_secs_f64(run),
+                Duration::from_secs_f64(interval),
+            );
         }
         other => {
-            eprintln!("unknown subcommand {other:?}; expected: forward-check | selfplay | selfplay-pipe | selfplay-serve");
+            eprintln!("unknown subcommand {other:?}; expected: forward-check | serve | bench");
             std::process::exit(2);
         }
     }

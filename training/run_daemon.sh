@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Indefinite self-play training daemon (strict-synchronous loop, 30-min snapshots).
+# pm2 entrypoint for indefinite ISMCTS self-play training (continuous AlphaZero
+# loop: streaming self-play -> replay buffer -> paced SGD, 4h snapshots + eval).
 #
-#   cd training && ./run_daemon.sh            # foreground
-#   OUT_DIR=runs/run1 nohup ./run_daemon.sh > runs/run1.log 2>&1 &   # detached
+#   OUT_DIR=.../runs/run2 INIT_FROM=.../runs/run1/snapshots/snap_h00019_*.safetensors \
+#     pm2 start training/run_daemon.sh --name fox-train --kill-timeout 20000
 #
-# Resumes from <OUT_DIR>/latest.pt if present. The orchestrator sets
-# LD_LIBRARY_PATH for the Rust self-play / eval subprocesses itself.
+# Resumes from <OUT_DIR>/latest.pt if present. INIT_FROM warm-starts a fresh run
+# (weights only) from a .pt checkpoint or a raw .safetensors snapshot; it is
+# ignored once latest.pt exists. The orchestrator sets LD_LIBRARY_PATH for the
+# Rust self-play / eval subprocesses itself.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -14,16 +17,21 @@ cd "$DIR"
 source .venv/bin/activate
 export SELFPLAY_PYTHON="$DIR/.venv/bin/python"
 
+INIT_ARGS=()
+if [[ -n "${INIT_FROM:-}" ]]; then
+  INIT_ARGS=(--init-from "$INIT_FROM")
+fi
+
 exec python orchestrator.py \
-  --out-dir "${OUT_DIR:-runs/run1}" \
-  --snapshot-every "${SNAPSHOT_EVERY:-30m}" \
-  --matches "${MATCHES:-2048}" \
-  --selfplay-batch "${SELFPLAY_BATCH:-1024}" \
-  --selfplay-threads "${SELFPLAY_THREADS:-16}" \
-  --sgd-batch "${SGD_BATCH:-65536}" \
-  --lr "${LR:-1e-3}" \
-  --c-entropy "${C_ENTROPY:-0.01}" \
-  --eval-games "${EVAL_GAMES:-200}" \
-  --n-top "${N_TOP:-2}" \
-  --n-anchors "${N_ANCHORS:-3}" \
-  --seed "${SEED:-42}"
+  --out-dir "${OUT_DIR:-runs/run2}" \
+  --snapshot-every "${SNAPSHOT_EVERY:-4h}" \
+  --sims "${SIMS:-400}" \
+  --threads "${THREADS:-16}" \
+  --slots "${SLOTS:-2}" \
+  --selfplay-batch "${SELFPLAY_BATCH:-512}" \
+  --batch-size "${BATCH_SIZE:-256}" \
+  --lr "${LR:-2e-3}" \
+  --eval-games "${EVAL_GAMES:-80}" \
+  --eval-sims "${EVAL_SIMS:-400}" \
+  --seed "${SEED:-42}" \
+  "${INIT_ARGS[@]}"

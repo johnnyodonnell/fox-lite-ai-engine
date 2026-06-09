@@ -77,7 +77,7 @@ pub fn real_card_from_canon_index(ci: usize, trump: u8) -> Card {
 }
 
 /// Opponent (the seat that is NOT `mover`) void suits inferred from history.
-fn opponent_voids(state: &State, opponent: Player) -> [bool; NUM_SUITS] {
+pub fn opponent_voids(state: &State, opponent: Player) -> [bool; NUM_SUITS] {
     let mut voids = [false; NUM_SUITS];
     let hist = &state.trick_history;
     let mut i = 0;

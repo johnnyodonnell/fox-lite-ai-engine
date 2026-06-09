@@ -6,11 +6,11 @@
 //! all accumulated match results (random pinned at 0), and pool.json is updated.
 //!
 //! Unlike chess there is no auto-serving — promotion to the browser model stays
-//! manual (training/promote.py). The play mechanics are Fox Lite's own: greedy
-//! (argmax) policy, single forward per move, no MCTS, no draws.
+//! manual (training/promote.py). Net agents play by ISMCTS search (`--sims`
+//! simulations, root noise off, argmax-visit move); `random` is the floor anchor.
 //!
-//!   evaluate_rs --run-dir runs/run1 --candidate runs/run1/snapshots/snap_x.safetensors
-//!               [--games 200] [--n-top 2] [--n-anchors 3] [--seed 0]
+//!   evaluate_rs --run-dir runs/run2 --candidate runs/run2/snapshots/snap_x.safetensors
+//!               [--games 80] [--sims 400] [--n-top 2] [--n-anchors 3] [--seed 0]
 //!
 //! stdout: human-readable `[eval]` logs (opponents, per-pair results, ratings).
 
@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use tch::{Device, Kind, Tensor};
 
 use foxlite_core::encode::{encode, legal_mask, real_card_from_canon_index, INPUT_SIZE};
+use foxlite_core::mcts::{run_search, sample_move};
 use foxlite_core::{Phase, Player, State, NUM_CARDS};
 use selfplay_rs::net::Net;
 
@@ -43,41 +44,38 @@ fn round1(x: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Players / match play (Fox Lite domain: greedy argmax, no MCTS, no draws)
+// Players / match play (Fox Lite domain: ISMCTS net agent + random, no draws)
 // ---------------------------------------------------------------------------
 enum Agent {
-    Net(Net),
+    /// Neural agent: ISMCTS search (`sims` simulations, noise off) from the
+    /// mover's information set, picking the argmax-visit move.
+    Net { net: Net, sims: usize },
     Random,
 }
 
 impl Agent {
     /// Choose a canonical card index for `mover` in `state`.
     fn act(&self, state: &State, mover: Player, rng: &mut StdRng) -> usize {
-        let mask = legal_mask(state, mover);
         match self {
             Agent::Random => {
+                let mask = legal_mask(state, mover);
                 let legal: Vec<usize> = (0..NUM_CARDS).filter(|&j| mask[j] != 0.0).collect();
                 legal[rng.gen_range(0..legal.len())]
             }
-            Agent::Net(net) => {
-                let v = encode(state, mover);
-                let x = Tensor::from_slice(&v)
-                    .reshape([1, INPUT_SIZE as i64])
-                    .to_device(net.device());
-                let (logits, _) = net.forward(&x);
-                let logits = logits.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
-                let mut buf = [0f32; NUM_CARDS];
-                logits.copy_data(&mut buf, NUM_CARDS);
-                // argmax over legal
-                let mut best = usize::MAX;
-                let mut best_v = f32::NEG_INFINITY;
-                for j in 0..NUM_CARDS {
-                    if mask[j] != 0.0 && buf[j] > best_v {
-                        best_v = buf[j];
-                        best = j;
-                    }
-                }
-                best
+            Agent::Net { net, sims } => {
+                let arena = run_search(state, mover, *sims, false, rng, |s, m| {
+                    let v = encode(s, m);
+                    let x = Tensor::from_slice(&v)
+                        .reshape([1, INPUT_SIZE as i64])
+                        .to_device(net.device());
+                    let (logits, value) = net.forward(&x);
+                    let logits = logits.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
+                    let mut lb = vec![0f32; NUM_CARDS];
+                    logits.copy_data(&mut lb, NUM_CARDS);
+                    let value = value.to_kind(Kind::Float).to_device(Device::Cpu).double_value(&[0]);
+                    (lb, value)
+                });
+                sample_move(&arena, 0, 0.0, rng) // temperature 0 = argmax visits
             }
         }
     }
@@ -275,6 +273,7 @@ fn main() {
     let run_dir = PathBuf::from(flag(&args, "--run-dir", "runs/run1"));
     let candidate = PathBuf::from(flag(&args, "--candidate", ""));
     let games: usize = flag(&args, "--games", "200").parse().unwrap();
+    let sims: usize = flag(&args, "--sims", "400").parse().unwrap();
     let n_top: usize = flag(&args, "--n-top", "2").parse().unwrap();
     let n_anchors: usize = flag(&args, "--n-anchors", "3").parse().unwrap();
     let seed: u64 = flag(&args, "--seed", "0").parse().unwrap();
@@ -319,7 +318,10 @@ fn main() {
     }
     println!("[eval] opponents={opponents:?}");
 
-    let cand = Agent::Net(Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float));
+    let cand = Agent::Net {
+        net: Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float),
+        sims,
+    };
 
     // Resolve each opponent's safetensors path up front so the match loop can
     // mutate pool.results without holding a borrow on the pool.
@@ -339,11 +341,10 @@ fn main() {
     for (opp, st) in &opp_specs {
         let opp_agent = match st {
             None => Agent::Random,
-            Some(p) => Agent::Net(Net::load(
-                run_dir.join(p).to_str().expect("utf8 path"),
-                dev,
-                Kind::Float,
-            )),
+            Some(p) => Agent::Net {
+                net: Net::load(run_dir.join(p).to_str().expect("utf8 path"), dev, Kind::Float),
+                sims,
+            },
         };
         let wins = play_series(&cand, &opp_agent, games, &mut rng);
         pool.results.push(MatchResult {
