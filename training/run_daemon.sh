@@ -22,7 +22,7 @@ exec python orchestrator.py \
   --selfplay-threads "${SELFPLAY_THREADS:-16}" \
   --sgd-batch "${SGD_BATCH:-65536}" \
   --lr "${LR:-1e-3}" \
-  --c-entropy "${C_ENTROPY:-0.05}" \
+  --c-entropy "${C_ENTROPY:-0.01}" \
   --eval-games "${EVAL_GAMES:-200}" \
   --n-top "${N_TOP:-2}" \
   --n-anchors "${N_ANCHORS:-3}" \
