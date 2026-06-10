@@ -8,8 +8,11 @@
 //! Topology:
 //!   - N worker threads each drive one game's ISMCTS FSM until it yields ONE leaf
 //!     to evaluate (root expand or a simulation leaf) or the game finishes (rows
-//!     streamed to the sink). An empty queue => spawn a fresh game (dynamic game
-//!     count, self-regulating to fill the pipe);
+//!     streamed to the sink). Workers claim scattered games in small chunks from
+//!     the ply-bucketed return queue, highest ply first — the fast lane that keeps
+//!     nearly-finished games finishing and the completion stream smooth. An empty
+//!     return queue => spawn a fresh game (dynamic game count, self-regulating to
+//!     fill the pipe);
 //!   - ONE bounded ply-priority pre-inference queue (most real-moves-made first),
 //!     so games closest to finishing are evaluated soonest;
 //!   - ONE inference thread: gathers BATCH leaf encodings, runs the fp32 forward,
@@ -17,14 +20,19 @@
 //!     and loops to launch the next batch. It also mtime-polls the weights sidecar
 //!     and `Net::reload`s in place between batches (weight hot-reload);
 //!   - ONE scatter thread: waits the event, reads (logits, value) back to the
-//!     host, attaches each game's result, and requeues it for a worker.
+//!     host, attaches each game's result, and bulk-pushes the batch back into the
+//!     return queue.
+//!
+//! Both shared queues are ply-bucketed (one Vec per ply count), NOT comparison
+//! heaps: push is O(1) and bulk drains move whole buckets, so every lock hold is
+//! tiny. The previous global Mutex<BinaryHeap> pair spent ~40% of worker on-CPU
+//! time in lock machinery (the 4096-pop gather hold convoyed all workers every
+//! batch).
 //!
 //! Each ISMCTS decision re-determinizes the hidden cards every simulation (true
 //! ISMCTS); the leaf-batching means a single game contributes ~`sims` forwards per
 //! move, all interleaved with every other in-flight game's forwards.
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::io::{self, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -103,7 +111,6 @@ struct Decision {
     seat: Player,
 }
 struct InFlight {
-    id: u64,
     state: State,     // the TRUE match state
     searcher: Player, // seat to move at the current decision (= state.awaiting)
     arena: Vec<Node>, // ISMCTS tree for the current decision
@@ -127,7 +134,6 @@ fn spawn_fresh(shared: &Shared) -> InFlight {
     let state = State::new_match(&mut rng);
     let searcher = state.awaiting.expect("fresh match awaits a leader");
     InFlight {
-        id,
         det: state.clone(),
         leaf_det: state.clone(),
         state,
@@ -285,88 +291,160 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
     }
 }
 
-// --- ply-priority queues (most real moves made first) ------------------------
-struct Queued {
-    key: u64,
-    seq: u64,
-    item: Box<InFlight>,
-}
-impl PartialEq for Queued {
-    fn eq(&self, o: &Self) -> bool {
-        self.key == o.key && self.seq == o.seq
-    }
-}
-impl Eq for Queued {}
-impl Ord for Queued {
-    fn cmp(&self, o: &Self) -> Ordering {
-        self.key.cmp(&o.key).then_with(|| self.seq.cmp(&o.seq))
-    }
-}
-impl PartialOrd for Queued {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-fn priority_key(g: &InFlight) -> u64 {
-    g.decisions.len() as u64
+// --- ply-bucketed priority queue (most real moves made first) -----------------
+//
+// The priority key is the number of real moves already made — a small bounded
+// integer — so one Vec per ply replaces a comparison heap: push is O(1), and a
+// batch gather drains whole buckets top-down (pointer memmoves, not per-item
+// sift-downs), keeping every lock hold tiny.
+
+/// A match is at most 7 rounds (every round awards >= 6 total points and 21
+/// ends it) x 26 plies = 182 plies, and a game is re-queued having made at most
+/// 181 moves — so ply keys span 0..=181. The min() clamp is belt-and-braces.
+const N_BUCKETS: usize = 182;
+
+fn priority_key(g: &InFlight) -> usize {
+    g.decisions.len().min(N_BUCKETS - 1)
 }
 
-/// Bounded, blocking ply-priority pre-inference queue (chess's PreInferQueue).
+struct Buckets {
+    by_ply: Vec<Vec<Box<InFlight>>>,
+    len: usize,
+    hi: usize, // highest possibly-non-empty bucket (raised on push, settled by drains)
+}
+impl Buckets {
+    fn new() -> Buckets {
+        Buckets { by_ply: (0..N_BUCKETS).map(|_| Vec::new()).collect(), len: 0, hi: 0 }
+    }
+    fn push(&mut self, g: Box<InFlight>) {
+        let k = priority_key(&g);
+        self.by_ply[k].push(g);
+        self.len += 1;
+        if k > self.hi {
+            self.hi = k;
+        }
+    }
+    /// Move up to `max` games from the highest buckets into `out` (newest first
+    /// within a ply, mirroring the old heap's seq tie-break). Returns the count.
+    fn drain_top(&mut self, max: usize, out: &mut Vec<Box<InFlight>>) -> usize {
+        let want = max.min(self.len);
+        let mut moved = 0;
+        let mut b = self.hi;
+        while moved < want {
+            let take = (want - moved).min(self.by_ply[b].len());
+            if take > 0 {
+                let bucket = &mut self.by_ply[b];
+                let at = bucket.len() - take;
+                out.extend(bucket.drain(at..));
+                self.len -= take;
+                moved += take;
+            }
+            if moved == want || b == 0 {
+                break;
+            }
+            b -= 1;
+        }
+        self.hi = b;
+        moved
+    }
+}
+
+struct PreInferState {
+    buckets: Buckets,
+    // Waiter bookkeeping so notifies are skipped (no futex syscall) when no one
+    // is parked — the common case for both condvars.
+    waiting_pushers: usize,
+    gather_waiting: bool,
+}
+
+/// Bounded, blocking ply-priority pre-inference queue.
 struct PreInferQueue {
-    inner: Mutex<BinaryHeap<Queued>>,
-    not_empty: Condvar,
-    not_full: Condvar,
+    inner: Mutex<PreInferState>,
+    batch_ready: Condvar, // inference thread waits here for len >= batch
+    not_full: Condvar,    // workers wait here for len < cap
     cap: usize,
+    batch: usize,
     closed: AtomicBool,
 }
 impl PreInferQueue {
-    fn new(cap: usize) -> PreInferQueue {
+    fn new(cap: usize, batch: usize) -> PreInferQueue {
         PreInferQueue {
-            inner: Mutex::new(BinaryHeap::new()),
-            not_empty: Condvar::new(),
+            inner: Mutex::new(PreInferState {
+                buckets: Buckets::new(),
+                waiting_pushers: 0,
+                gather_waiting: false,
+            }),
+            batch_ready: Condvar::new(),
             not_full: Condvar::new(),
             cap,
+            batch,
             closed: AtomicBool::new(false),
         }
     }
     fn push(&self, g: Box<InFlight>) -> Result<(), ()> {
         let mut q = self.inner.lock().unwrap();
-        while q.len() >= self.cap && !self.closed.load(AtomicOrdering::Relaxed) {
+        while q.buckets.len >= self.cap && !self.closed.load(AtomicOrdering::Relaxed) {
+            q.waiting_pushers += 1;
             q = self.not_full.wait(q).unwrap();
+            q.waiting_pushers -= 1;
         }
         if self.closed.load(AtomicOrdering::Relaxed) {
             return Err(());
         }
-        let key = priority_key(&g);
-        let seq = g.id;
-        q.push(Queued { key, seq, item: g });
+        q.buckets.push(g);
+        // Edge-triggered wake: gather re-checks `len` itself while it stays
+        // >= batch, so signalling every push would be a wasted syscall per leaf.
+        let wake = q.gather_waiting && q.buckets.len >= self.batch;
         drop(q);
-        self.not_empty.notify_one();
+        if wake {
+            self.batch_ready.notify_one();
+        }
         Ok(())
     }
-    fn gather(&self, batch: usize) -> Option<Vec<Box<InFlight>>> {
+    fn gather(&self) -> Option<Vec<Box<InFlight>>> {
+        let batch = self.batch;
         let mut q = self.inner.lock().unwrap();
-        while q.len() < batch && !self.closed.load(AtomicOrdering::Relaxed) {
-            q = self.not_empty.wait(q).unwrap();
+        while q.buckets.len < batch && !self.closed.load(AtomicOrdering::Relaxed) {
+            q.gather_waiting = true;
+            q = self.batch_ready.wait(q).unwrap();
+            q.gather_waiting = false;
         }
-        if q.len() < batch {
+        if q.buckets.len < batch {
             return None; // closed with a partial batch -> drop and shut down
         }
-        let games: Vec<Box<InFlight>> = (0..batch).map(|_| q.pop().unwrap().item).collect();
+        let mut games: Vec<Box<InFlight>> = Vec::with_capacity(batch);
+        q.buckets.drain_top(batch, &mut games);
+        let wake = q.waiting_pushers > 0;
         drop(q);
-        self.not_full.notify_all();
+        if wake {
+            // At most n_threads waiters, each doing an O(1) push on wake; the
+            // old per-push notify_one + post-gather broadcast was a herd.
+            self.not_full.notify_all();
+        }
         Some(games)
     }
     fn close(&self) {
         self.closed.store(true, AtomicOrdering::Relaxed);
-        self.not_empty.notify_all();
+        self.batch_ready.notify_all();
         self.not_full.notify_all();
     }
 }
 
+/// Games a worker claims from the return queue per lock hold. Large enough to
+/// make the lock acquisition rate trivial (~2 per worker per batch cycle),
+/// small enough that the ply fast-lane keeps cross-cycle granularity: a worker
+/// re-checks the top buckets every CLAIM games, so nearly-finished games keep
+/// jumping ahead and completions stay smooth. (v1 of this rework used plain
+/// per-worker inboxes — no cross-game priority — and the whole in-flight
+/// population marched in lockstep, finishing in synchronized waves that
+/// transiently drained the pipe and cost ~6% games/sec.)
+const CLAIM: usize = 32;
+
 struct Shared {
-    queue: Mutex<BinaryHeap<Queued>>, // requeued games awaiting a worker
-    queue_cv: Condvar,
+    /// Scattered games (result attached) awaiting a worker, ply-bucketed:
+    /// scatter bulk-pushes a batch in one short hold (O(1) per game), workers
+    /// claim CLAIM-sized chunks from the top buckets.
+    returns: Mutex<Buckets>,
     preinfer: PreInferQueue,
     stop: AtomicBool,
     id_counter: AtomicU64,
@@ -376,17 +454,24 @@ struct Shared {
 }
 
 fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
+    let mut local: Vec<Box<InFlight>> = Vec::new(); // claimed chunk, highest ply last
     loop {
         if shared.stop.load(AtomicOrdering::Relaxed) {
             return;
         }
-        let mut g: Box<InFlight> = {
-            let mut q = shared.queue.lock().unwrap();
-            match q.pop() {
-                Some(qd) => qd.item,
-                None => {
-                    drop(q);
-                    Box::new(spawn_fresh(&shared))
+        let mut g: Box<InFlight> = match local.pop() {
+            Some(g) => g,
+            None => {
+                {
+                    let mut q = shared.returns.lock().unwrap();
+                    q.drain_top(CLAIM, &mut local);
+                }
+                local.reverse(); // drain_top fills highest-first; pop() takes the back
+                match local.pop() {
+                    Some(g) => g,
+                    // Nothing scattered anywhere => spawn rather than wait
+                    // (dynamic game count; the preinfer cap is the backpressure).
+                    None => Box::new(spawn_fresh(&shared)),
                 }
             }
         };
@@ -412,21 +497,20 @@ fn requeue_scattered(
     shared: &Shared,
     logits: Arc<Vec<f32>>,
     values: &[f32],
-    games: Vec<Box<InFlight>>,
+    mut games: Vec<Box<InFlight>>,
 ) {
-    let mut q = shared.queue.lock().unwrap();
-    for (r, mut g) in games.into_iter().enumerate() {
+    // Attach results outside the lock; the hold below is pure bucket pushes.
+    for (r, g) in games.iter_mut().enumerate() {
         g.pending = Some(EvalResult {
             logits: Arc::clone(&logits),
             row: r,
             value: values[r],
         });
-        let key = priority_key(&g);
-        let seq = g.id;
-        q.push(Queued { key, seq, item: g });
     }
-    drop(q);
-    shared.queue_cv.notify_all();
+    let mut q = shared.returns.lock().unwrap();
+    for g in games {
+        q.push(g);
+    }
 }
 
 // --- inference + scatter -----------------------------------------------------
@@ -569,7 +653,7 @@ fn inference_thread(shared: Arc<Shared>, work_tx: SyncSender<WorkItem>) {
         if shared.stop.load(AtomicOrdering::Relaxed) {
             return;
         }
-        let games = match shared.preinfer.gather(batch) {
+        let games = match shared.preinfer.gather() {
             Some(g) => g,
             None => return, // closed: dropping work_tx drains the scatter thread
         };
@@ -612,11 +696,11 @@ pub fn pick_device(cpu: bool) -> Device {
 }
 
 fn make_shared(config: Config) -> Arc<Shared> {
-    let cap = (2 * config.n_slots.max(1) * config.batch.max(1)).max(config.batch.max(1));
+    let batch = config.batch.max(1);
+    let cap = (2 * config.n_slots.max(1) * batch).max(batch);
     Arc::new(Shared {
-        queue: Mutex::new(BinaryHeap::new()),
-        queue_cv: Condvar::new(),
-        preinfer: PreInferQueue::new(cap),
+        returns: Mutex::new(Buckets::new()),
+        preinfer: PreInferQueue::new(cap, batch),
         stop: AtomicBool::new(false),
         id_counter: AtomicU64::new(0),
         config,
@@ -655,7 +739,6 @@ fn spawn_pipeline(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>
 fn shutdown(shared: &Shared, p: Pipeline) {
     shared.stop.store(true, AtomicOrdering::Relaxed);
     shared.preinfer.close();
-    shared.queue_cv.notify_all();
     for h in p.workers {
         let _ = h.join();
     }
