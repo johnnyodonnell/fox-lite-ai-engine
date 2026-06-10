@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from encode import INPUT_SIZE, NUM_CARDS
+from encode import INPUT_SIZE, NUM_CARDS, TARGET_SCORE
 from export import export_onnx, save_weights_st
 from net import FoxNet, N_BLOCKS, WIDTH, n_params
 from train import ReplayBuffer, train_step
@@ -37,6 +37,16 @@ HERE = Path(__file__).resolve().parent
 SELFPLAY_BIN = HERE / "selfplay_rs" / "target" / "release" / "selfplay_rs"
 EVAL_BIN = HERE / "selfplay_rs" / "target" / "release" / "evaluate_rs"
 ROW_FLOATS = INPUT_SIZE + NUM_CARDS + 1  # state[230] + pi[33] + z = 264
+
+# Score-equity table (round-boundary backups in the Rust search): P(win | my
+# score, opp score) counted from decision rows. Mover-relative score one-hots
+# live at the tail of the encoding.
+EQ_N = TARGET_SCORE  # 21
+EQ_SELF_OFF = INPUT_SIZE - 2 * EQ_N
+EQ_OPP_OFF = INPUT_SIZE - EQ_N
+EQ_ALPHA = 10.0  # Laplace smoothing toward 0.5 for sparse cells
+EQ_DECAY = 0.9971  # per-publish (15s) count decay -> ~1h half-life; the table
+                   # tracks the CURRENT policy's equity, not the run's history
 
 
 def parse_duration(spec: str) -> float:
@@ -165,6 +175,8 @@ def main():
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     buf = ReplayBuffer(args.buffer_capacity)
     rng = np.random.default_rng(args.seed)
+    eq_wins = np.zeros((EQ_N, EQ_N), dtype=np.float64)
+    eq_visits = np.zeros((EQ_N, EQ_N), dtype=np.float64)
 
     # ----- Resume from latest.pt, else warm-start from --init-from, else cold -----
     base_elapsed = 0.0
@@ -182,6 +194,9 @@ def main():
         next_snapshot_at = ckpt.get("next_snapshot_at", snapshot_interval)
         if "np_rng" in ckpt:
             rng.bit_generator.state = ckpt["np_rng"]
+        if "eq_wins" in ckpt:
+            eq_wins[:] = ckpt["eq_wins"]
+            eq_visits[:] = ckpt["eq_visits"]
         print(f"resumed from {latest} (elapsed={base_elapsed/3600:.2f}h "
               f"games={total_games} steps={total_train_steps})", flush=True)
     elif args.init_from:
@@ -196,6 +211,22 @@ def main():
 
     serving_st = out_dir / "serving_weights.safetensors"
     save_weights_st(net, str(serving_st))  # initial weights for the first self-play
+
+    serving_eq = out_dir / "serving_equity.f32"
+
+    def publish_equity():
+        # Decay the counts so the table tracks the CURRENT policy's equity
+        # (~1h half-life at 15s publishes), then write the smoothed
+        # P(win | my_score, opp_score) table atomically (441 f32 LE).
+        nonlocal eq_wins, eq_visits
+        eq_wins *= EQ_DECAY
+        eq_visits *= EQ_DECAY
+        p = (eq_wins + EQ_ALPHA * 0.5) / (eq_visits + EQ_ALPHA)
+        tmp = serving_eq.with_suffix(".tmp")
+        p.astype("<f4").tofile(tmp)
+        tmp.replace(serving_eq)
+
+    publish_equity()  # initial table (0.5 everywhere on cold start) for the worker
 
     # Export the fused AOTInductor forward once; the worker loads it and hot-swaps
     # fresh weights on each publish. On any failure, fall back to the eager bf16 path.
@@ -226,6 +257,8 @@ def main():
             "train_steps": total_train_steps,
             "next_snapshot_at": next_snapshot_at,
             "np_rng": rng.bit_generator.state,
+            "eq_wins": eq_wins,
+            "eq_visits": eq_visits,
         }, tmp)
         tmp.replace(latest)
 
@@ -256,6 +289,7 @@ def main():
         try:
             proc = subprocess.Popen(
                 [str(EVAL_BIN), "--run-dir", str(out_dir), "--candidate", str(st_path),
+                 "--equity", str(serving_eq),
                  "--games", str(args.eval_games), "--sims", str(args.eval_sims),
                  "--n-top", str(args.n_top), "--n-anchors", str(args.n_anchors),
                  "--seed", str(total_train_steps)],
@@ -293,9 +327,14 @@ def main():
             rows = [(r[:INPUT_SIZE].copy(),
                      r[INPUT_SIZE:INPUT_SIZE + NUM_CARDS].copy(),
                      float(r[-1])) for r in flat]
+            # Score-equity observations, vectorized while the frame is still one
+            # array: mover-relative score one-hot argmaxes + win flag from z.
+            eq_obs = (flat[:, EQ_SELF_OFF:EQ_SELF_OFF + EQ_N].argmax(axis=1),
+                      flat[:, EQ_OPP_OFF:EQ_OPP_OFF + EQ_N].argmax(axis=1),
+                      flat[:, -1] > 0)
             while not stop.is_set():
                 try:
-                    out_queue.put((rows, 1), timeout=0.5)
+                    out_queue.put((rows, 1, eq_obs), timeout=0.5)
                     break
                 except pyqueue.Full:
                     pass
@@ -306,6 +345,7 @@ def main():
                              f"(build it: cd selfplay_rs && cargo build --release)")
         cmd = [str(SELFPLAY_BIN), "serve",
                "--weights", str(serving_st),
+               "--equity", str(serving_eq),
                "--threads", str(args.threads),
                "--sims", str(args.sims),
                "--slots", str(args.slots),
@@ -349,23 +389,26 @@ def main():
                 launch_eval(st_path)
                 continue
 
-            # Drain finished games into the ring buffer.
-            got_any = False
-            for _ in range(args.queue_max):
-                try:
-                    rows, n_games = out_queue.get_nowait()
-                except pyqueue.Empty:
-                    break
+            # Drain finished games into the ring buffer + equity counts.
+            def absorb(frame):
+                nonlocal total_games, gen_samples
+                rows, n_games, (si, oi, won) = frame
                 buf.add_many(rows)
                 total_games += n_games
                 gen_samples += len(rows)
+                np.add.at(eq_visits, (si, oi), 1.0)
+                np.add.at(eq_wins, (si[won], oi[won]), 1.0)
+
+            got_any = False
+            for _ in range(args.queue_max):
+                try:
+                    absorb(out_queue.get_nowait())
+                except pyqueue.Empty:
+                    break
                 got_any = True
             if len(buf) < args.min_buffer_for_train and not got_any:
                 try:
-                    rows, n_games = out_queue.get(timeout=1.0)
-                    buf.add_many(rows)
-                    total_games += n_games
-                    gen_samples += len(rows)
+                    absorb(out_queue.get(timeout=1.0))
                 except pyqueue.Empty:
                     pass
 
@@ -393,6 +436,7 @@ def main():
             now = time.time()
             if now - last_publish >= publish_interval:
                 save_weights_st(net, str(serving_st))
+                publish_equity()
                 last_publish = now
             if now - last_latest_save >= save_latest_interval:
                 save_latest()

@@ -34,6 +34,7 @@ fn parse_pipeline_config(args: &[String]) -> pipeline::Config {
         batch: flag(args, "--batch", "512").parse().unwrap(),
         weights_path: flag(args, "--weights", "serving_weights.safetensors"),
         model_path: flag(args, "--model", ""),
+        equity_path: flag(args, "--equity", ""),
         reload_every: Duration::from_millis(flag(args, "--reload-ms", "2000").parse().unwrap()),
         cpu: args.iter().any(|a| a == "--cpu"),
     }
