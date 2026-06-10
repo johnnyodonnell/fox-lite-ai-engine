@@ -28,7 +28,7 @@ use std::collections::BinaryHeap;
 use std::io::{self, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -40,9 +40,9 @@ use foxlite_core::determinize::determinize_into;
 use foxlite_core::encode::{encode, encode_into, real_card_from_canon_index, INPUT_SIZE};
 use foxlite_core::mcts::{
     add_dirichlet_noise, backprop, expand_node, new_root, sample_move, temperature, visits_to_pi,
-    walk_to_leaf, Node, ScoreEquity, WalkResult,
+    walk_to_leaf, Node, WalkResult,
 };
-use foxlite_core::{Phase, Player, State, NUM_CARDS, TARGET_SCORE};
+use foxlite_core::{Phase, Player, State, NUM_CARDS};
 
 use crate::aoti::AotiModel;
 use crate::cuda_event::CudaEvent;
@@ -63,28 +63,8 @@ pub struct Config {
     pub batch: usize,   // GPU forward width
     pub weights_path: String,
     pub model_path: String, // AOTInductor .pt2 (fused forward); empty -> eager tch forward
-    pub equity_path: String, // score-equity sidecar (441 f32 LE); empty -> net-eval boundaries
     pub reload_every: Duration,
     pub cpu: bool,
-}
-
-/// Load the score-equity sidecar: `TARGET_SCORE`^2 f32 LE values, row-major
-/// `[my_score][opp_score]`. `None` on a missing/short file (e.g. mid-publish;
-/// the caller keeps the previous table and retries next tick).
-pub fn load_equity(path: &str) -> Option<ScoreEquity> {
-    const N: usize = TARGET_SCORE as usize;
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() != N * N * 4 {
-        return None;
-    }
-    let mut t = ScoreEquity([[0.5f32; N]; N]);
-    for i in 0..N {
-        for j in 0..N {
-            let off = (i * N + j) * 4;
-            t.0[i][j] = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-        }
-    }
-    Some(t)
 }
 
 // --- per-game seeding (splitmix64; determinism not required, just spread) ---
@@ -249,11 +229,7 @@ enum Advance {
 }
 
 /// Drive the game until it stages one leaf for evaluation or finishes.
-fn advance_until_eval_or_done(
-    g: &mut InFlight,
-    config: &Config,
-    equity: Option<&ScoreEquity>,
-) -> Advance {
+fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
     loop {
         match g.phase {
             GamePhase::NeedRootExpand => {
@@ -274,7 +250,7 @@ fn advance_until_eval_or_done(
                     continue;
                 }
                 determinize_into(&g.state, g.searcher, &mut g.rng, &mut g.det);
-                match walk_to_leaf(&mut g.arena, 0, &mut g.det, g.searcher, equity, &mut g.path, &mut g.leaf_det) {
+                match walk_to_leaf(&mut g.arena, 0, &mut g.det, g.searcher, &mut g.path, &mut g.leaf_det) {
                     WalkResult::Terminal { v_ref } => {
                         backprop(&mut g.arena, &g.path, v_ref);
                         g.phase = GamePhase::Simulating(s + 1);
@@ -397,9 +373,6 @@ struct Shared {
     config: Config,
     games_done: AtomicU64,
     rows_done: AtomicU64,
-    // Score-equity table for round-boundary backups; written by the inference
-    // thread on sidecar mtime change, read (Arc-cloned) by workers per advance.
-    equity: RwLock<Option<Arc<ScoreEquity>>>,
 }
 
 fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
@@ -420,8 +393,7 @@ fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
         if let Some(res) = g.pending.take() {
             apply_result(&mut g, res, &shared.config);
         }
-        let equity = shared.equity.read().unwrap().clone();
-        match advance_until_eval_or_done(&mut g, &shared.config, equity.as_deref()) {
+        match advance_until_eval_or_done(&mut g, &shared.config) {
             Advance::Eval => {
                 if shared.preinfer.push(g).is_err() {
                     return; // closed (shutdown)
@@ -588,48 +560,9 @@ impl Infer {
     }
 }
 
-/// Reload the equity sidecar on mtime change (same cadence/idiom as the weights
-/// hot-reload). Owns its mtime state; publishes the table through `shared.equity`.
-struct EquityReload {
-    last_check: Instant,
-    last_mtime: Option<std::time::SystemTime>,
-}
-impl EquityReload {
-    fn new(shared: &Shared) -> EquityReload {
-        let mut r = EquityReload { last_check: Instant::now(), last_mtime: None };
-        r.reload_if_changed(shared); // initial load before the first forward
-        r
-    }
-    fn maybe_reload(&mut self, shared: &Shared) {
-        if self.last_check.elapsed() < shared.config.reload_every {
-            return;
-        }
-        self.last_check = Instant::now();
-        self.reload_if_changed(shared);
-    }
-    fn reload_if_changed(&mut self, shared: &Shared) {
-        let path = &shared.config.equity_path;
-        if path.is_empty() {
-            return;
-        }
-        let m = std::fs::metadata(path).and_then(|md| md.modified()).ok();
-        if m.is_none() || m == self.last_mtime {
-            return;
-        }
-        match load_equity(path) {
-            Some(t) => {
-                *shared.equity.write().unwrap() = Some(Arc::new(t));
-                self.last_mtime = m;
-            }
-            None => {} // transient read; keep last_mtime so we retry next tick
-        }
-    }
-}
-
 fn inference_thread(shared: Arc<Shared>, work_tx: SyncSender<WorkItem>) {
     let dev = pick_device(shared.config.cpu);
     let mut infer = Infer::new(&shared.config, dev);
-    let mut eq_reload = EquityReload::new(&shared);
     let batch = shared.config.batch.max(1);
     let mut enc: Vec<f32> = Vec::with_capacity(batch * ENC_LEN);
     loop {
@@ -645,7 +578,6 @@ fn inference_thread(shared: Arc<Shared>, work_tx: SyncSender<WorkItem>) {
             enc.extend_from_slice(&g.staged_enc);
         }
         infer.maybe_reload();
-        eq_reload.maybe_reload(&shared);
         let m = games.len();
         let (logits, values, event) = infer.launch(&enc, m);
         if work_tx.send(WorkItem { logits, values, event, games }).is_err() {
@@ -690,7 +622,6 @@ fn make_shared(config: Config) -> Arc<Shared> {
         config,
         games_done: AtomicU64::new(0),
         rows_done: AtomicU64::new(0),
-        equity: RwLock::new(None),
     })
 }
 

@@ -20,13 +20,11 @@
 //! winner leads again, so the mover can repeat) without chess's depth-parity flip.
 //!
 //! Search is bounded to the current round: a path that completes the round ends
-//! the simulation. If the round ends the match → terminal value ±1. Otherwise the
-//! continuation value comes from the [`ScoreEquity`] table when one is provided
-//! (the EXACT new scores index P(win match | scores, fresh deal), counted from
-//! finished games — so round-boundary backups don't depend on value-head quality);
-//! without a table it falls back to a FRESH net eval of the state just before the
-//! round-ending move, under the CURRENT determinization (`WalkResult::BoundaryEval`).
-//! So determinization only ever covers the current round's hidden cards.
+//! the simulation. If the round ends the match → terminal value ±1; otherwise the
+//! value is bootstrapped from a FRESH net eval of the state just before the
+//! round-ending move, under the CURRENT determinization (`WalkResult::BoundaryEval`
+//! — a frozen per-node value would belong to whichever hidden world first expanded
+//! the node). So determinization only ever covers the current round's hidden cards.
 
 use rand::Rng;
 use rand_distr::{Dirichlet, Distribution};
@@ -58,14 +56,6 @@ pub fn temperature(round_num: u32, trick_num: u32) -> f64 {
     let frac = (((match_trick - TEMP_EARLY_TRICKS) as f64) / TEMP_ANNEAL_TRICKS as f64).min(1.0);
     TEMP_OPENING + frac * (TEMP_FLOOR - TEMP_OPENING)
 }
-
-/// Match-win probability over score states, indexed `[my_score][opp_score]`
-/// (both < `TARGET_SCORE`; only consulted when the round did NOT end the match,
-/// so new scores are always in range): P(the player at `my_score` wins the match
-/// | a fresh round is about to be dealt). Estimated by the trainer as smoothed,
-/// decayed win counts over decision rows and republished as a sidecar; round
-/// leadership is marginalized out.
-pub struct ScoreEquity(pub [[f32; TARGET_SCORE as usize]; TARGET_SCORE as usize]);
 
 pub struct Node {
     pub prior: f64,
@@ -189,16 +179,15 @@ fn child_mover_after(state: &State, canon: usize, mover: Player) -> Player {
     }
 }
 
-/// Outcome of a `RoundOver` state: the match winner if the round ends the match
-/// (else `None`), plus both players' NEW totals `(human, bot)`. Mirrors
-/// `State::end_round` scoring + `State::match_winner` ties, read-only (no deal,
-/// no RNG) so search never crosses a round boundary.
-fn round_over_outcome(state: &State) -> (Option<Player>, u32, u32) {
+/// Match winner if a `RoundOver` state ends the match, else `None` (round
+/// continues). Mirrors `State::end_round` scoring + `State::match_winner` ties,
+/// read-only (no deal, no RNG) so search never crosses a round boundary.
+fn round_over_outcome(state: &State) -> Option<Player> {
     let hl = score_for_tricks(state.tricks_won[Player::Human.idx()]);
     let bl = score_for_tricks(state.tricks_won[Player::Bot.idx()]);
     let nh = state.score[Player::Human.idx()] + hl;
     let nb = state.score[Player::Bot.idx()] + bl;
-    let winner = if nh >= TARGET_SCORE || nb >= TARGET_SCORE {
+    if nh >= TARGET_SCORE || nb >= TARGET_SCORE {
         // Mirror `State::match_winner`: higher total wins; a tie is broken by the
         // final round's points, which can never themselves tie.
         if nh > nb {
@@ -212,8 +201,7 @@ fn round_over_outcome(state: &State) -> (Option<Player>, u32, u32) {
         }
     } else {
         None
-    };
-    (winner, nh, nb)
+    }
 }
 
 /// Bump availability for every currently-legal child, then pick the max-PUCT one.
@@ -275,7 +263,6 @@ pub fn walk_to_leaf(
     root: usize,
     det: &mut State,
     searcher: Player,
-    equity: Option<&ScoreEquity>,
     path: &mut Vec<usize>,
     boundary: &mut State,
 ) -> WalkResult {
@@ -309,26 +296,12 @@ pub fn walk_to_leaf(
             }
             Phase::RoundOver => {
                 debug_assert!(at_boundary, "round ended without a trick-13 follow");
-                let (winner, nh, nb) = round_over_outcome(det);
-                return match winner {
-                    Some(w) => {
-                        let v_ref = if w == searcher { 1.0 } else { -1.0 };
+                return match round_over_outcome(det) {
+                    Some(winner) => {
+                        let v_ref = if winner == searcher { 1.0 } else { -1.0 };
                         WalkResult::Terminal { v_ref }
                     }
-                    // Round continues: exact score-equity lookup when a table is
-                    // provided (new scores < TARGET_SCORE here), else a fresh net
-                    // eval of the pre-move boundary state.
-                    None => match equity {
-                        Some(eq) => {
-                            let (ms, os) = match searcher {
-                                Player::Human => (nh, nb),
-                                Player::Bot => (nb, nh),
-                            };
-                            let p = eq.0[ms as usize][os as usize] as f64;
-                            WalkResult::Terminal { v_ref: 2.0 * p - 1.0 }
-                        }
-                        None => WalkResult::BoundaryEval { mover },
-                    },
+                    None => WalkResult::BoundaryEval { mover },
                 };
             }
             Phase::MatchOver => unreachable!("search never deals a new round"),
@@ -462,7 +435,6 @@ pub fn run_search<R, F>(
     searcher: Player,
     sims: usize,
     add_noise: bool,
-    equity: Option<&ScoreEquity>,
     rng: &mut R,
     mut eval: F,
 ) -> Vec<Node>
@@ -481,7 +453,7 @@ where
     let mut boundary = root_state.clone();
     for _ in 0..sims {
         crate::determinize::determinize_into(root_state, searcher, rng, &mut det);
-        match walk_to_leaf(&mut arena, 0, &mut det, searcher, equity, &mut path, &mut boundary) {
+        match walk_to_leaf(&mut arena, 0, &mut det, searcher, &mut path, &mut boundary) {
             WalkResult::Eval { mover } => {
                 let leaf = *path.last().unwrap();
                 let (logits, value) = eval(&det, mover);
@@ -539,7 +511,7 @@ mod tests {
             }
             let searcher = s.awaiting.unwrap();
             let mut rng = StdRng::seed_from_u64(seed ^ 0xABCD);
-            let arena = run_search(&s, searcher, 64, true, None, &mut rng, dummy_eval);
+            let arena = run_search(&s, searcher, 64, true, &mut rng, dummy_eval);
 
             let mask = legal_mask(&s, searcher);
             let pi = visits_to_pi(&arena, 0, 1.0);
@@ -585,39 +557,11 @@ mod tests {
         let searcher = s.awaiting.unwrap();
         let mut rng = StdRng::seed_from_u64(99);
         let sims = 50;
-        let arena = run_search(&s, searcher, sims, false, None, &mut rng, dummy_eval);
+        let arena = run_search(&s, searcher, sims, false, &mut rng, dummy_eval);
         // Every simulation backprops through the root exactly once.
         assert_eq!(arena[0].visit_count as usize, sims);
         // Child visit counts sum to the simulation count (each sim picks one root child).
         let child_visits: u32 = arena[0].children.iter().map(|&(_, c)| arena[c as usize].visit_count).sum();
         assert_eq!(child_visits as usize, sims);
-    }
-
-    /// With an equity table, non-match-ending round boundaries back up 2p-1 as a
-    /// plain terminal (no net eval). A constant table p=1.0 means every boundary
-    /// backs up +1 for whichever seat searches — with a neutral dummy net, deep
-    /// late-round searches must still produce valid trees and visit counts.
-    #[test]
-    fn equity_table_drives_round_boundaries() {
-        let eq = ScoreEquity([[1.0f32; TARGET_SCORE as usize]; TARGET_SCORE as usize]);
-        let mut tested = 0;
-        for seed in 0..200u64 {
-            // Drive deep into a round so searches actually reach the boundary.
-            let s = play_some(20 + (seed % 7) as usize, seed);
-            if s.phase != Phase::Playing {
-                continue;
-            }
-            let searcher = s.awaiting.unwrap();
-            let mut rng = StdRng::seed_from_u64(seed ^ 0x5C0E);
-            let sims = 64;
-            let arena = run_search(&s, searcher, sims, false, Some(&eq), &mut rng, dummy_eval);
-            assert_eq!(arena[0].visit_count as usize, sims);
-            // Boundary backups are +1 (searcher POV); leaf evals are 0; match
-            // terminals are ±1 — so the root's mean value must stay in [-1, 1].
-            let q = arena[0].value_sum / arena[0].visit_count as f64;
-            assert!((-1.0..=1.0).contains(&q), "root q out of range: {q} (seed {seed})");
-            tested += 1;
-        }
-        assert!(tested > 20, "too few mid-round states exercised ({tested})");
     }
 }

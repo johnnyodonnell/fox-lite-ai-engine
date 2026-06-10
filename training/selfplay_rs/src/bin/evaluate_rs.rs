@@ -27,12 +27,10 @@ use tch::{Device, Kind, Tensor};
 use foxlite_core::determinize::determinize;
 use foxlite_core::encode::{encode, legal_mask, real_card_from_canon_index, INPUT_SIZE};
 use foxlite_core::mcts::{
-    backprop, expand_node, new_root, sample_move, walk_to_leaf, Node, ScoreEquity, WalkResult,
+    backprop, expand_node, new_root, sample_move, walk_to_leaf, Node, WalkResult,
 };
 use foxlite_core::{Phase, Player, State, NUM_CARDS};
 use selfplay_rs::net::Net;
-use selfplay_rs::pipeline::load_equity;
-use std::sync::Arc;
 
 const RANDOM: &str = "random"; // reserved name for the fixed floor anchor (Elo pinned at 0)
 
@@ -97,13 +95,8 @@ struct EvalLeaf {
 /// `(logits[m*NUM_CARDS], values[m])`. No root noise (this is evaluation, not
 /// self-play). `rng` drives the per-simulation determinization, consumed in
 /// holder order — so a single-holder run reproduces `mcts::run_search` exactly.
-fn run_simulations<F, R>(
-    holders: &mut [Holder],
-    sims: usize,
-    equity: Option<&ScoreEquity>,
-    rng: &mut R,
-    mut eval_fn: F,
-) where
+fn run_simulations<F, R>(holders: &mut [Holder], sims: usize, rng: &mut R, mut eval_fn: F)
+where
     F: FnMut(&[f32], usize) -> (Vec<f32>, Vec<f32>),
     R: Rng + ?Sized,
 {
@@ -138,7 +131,7 @@ fn run_simulations<F, R>(
             let searcher = holder.searcher;
             let mut det = determinize(holder.state, searcher, rng);
             let mut boundary = holder.state.clone();
-            match walk_to_leaf(&mut holder.arena, 0, &mut det, searcher, equity, &mut path, &mut boundary) {
+            match walk_to_leaf(&mut holder.arena, 0, &mut det, searcher, &mut path, &mut boundary) {
                 WalkResult::Terminal { v_ref } => {
                     backprop(&mut holder.arena, &path, v_ref);
                 }
@@ -188,9 +181,8 @@ fn run_simulations<F, R>(
 // ---------------------------------------------------------------------------
 enum Agent {
     /// Neural agent: ISMCTS search (`sims` simulations, noise off) from each
-    /// mover's information set, picking the argmax-visit move. `equity` drives
-    /// round-boundary backups when present (else net-eval boundaries).
-    Net { net: Net, sims: usize, equity: Option<Arc<ScoreEquity>> },
+    /// mover's information set, picking the argmax-visit move.
+    Net { net: Net, sims: usize },
     Random,
 }
 
@@ -209,16 +201,14 @@ impl Agent {
                     legal[rng.gen_range(0..legal.len())]
                 })
                 .collect(),
-            Agent::Net { net, sims, equity } => {
+            Agent::Net { net, sims } => {
                 // Fresh tree per move (no reuse) — simpler and fine for eval volumes.
                 let mut holders: Vec<Holder> = states
                     .iter()
                     .zip(searchers)
                     .map(|(&s, &searcher)| Holder { state: s, searcher, arena: new_root(searcher) })
                     .collect();
-                run_simulations(&mut holders, *sims, equity.as_deref(), rng, |enc, m| {
-                    eval_batch(net, enc, m)
-                });
+                run_simulations(&mut holders, *sims, rng, |enc, m| eval_batch(net, enc, m));
                 holders
                     .iter()
                     .map(|h| sample_move(&h.arena, 0, 0.0, rng)) // temperature 0 = argmax visits
@@ -471,21 +461,6 @@ fn main() {
         Device::Cpu
     };
 
-    // Optional score-equity sidecar for round-boundary backups (both agents share
-    // it — it is a property of the game + current self-play meta, not of a net).
-    let equity_path = flag(&args, "--equity", "");
-    let equity: Option<Arc<ScoreEquity>> = if equity_path.is_empty() {
-        None
-    } else {
-        match load_equity(&equity_path) {
-            Some(t) => Some(Arc::new(t)),
-            None => {
-                eprintln!("[eval] warn: unreadable equity table {equity_path}; net-eval boundaries");
-                None
-            }
-        }
-    };
-
     // One-off A/B mode: --vs <safetensors|random> plays candidate (--sims) against
     // a single opponent (--opp-sims, default --sims) and prints the result without
     // touching pool.json. sims=1 degenerates to argmax of the raw policy (one
@@ -498,12 +473,11 @@ fn main() {
         let cand = Agent::Net {
             net: Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float),
             sims,
-            equity: equity.clone(),
         };
         let opp_agent = if vs == RANDOM {
             Agent::Random
         } else {
-            Agent::Net { net: Net::load(&vs, dev, Kind::Float), sims: opp_sims, equity: equity.clone() }
+            Agent::Net { net: Net::load(&vs, dev, Kind::Float), sims: opp_sims }
         };
         let wins = play_match(&cand, &opp_agent, games, &mut rng);
         println!(
@@ -550,7 +524,6 @@ fn main() {
     let cand = Agent::Net {
         net: Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float),
         sims,
-        equity: equity.clone(),
     };
 
     // Resolve each opponent's safetensors path up front so the match loop can
@@ -574,7 +547,6 @@ fn main() {
             Some(p) => Agent::Net {
                 net: Net::load(run_dir.join(p).to_str().expect("utf8 path"), dev, Kind::Float),
                 sims,
-                equity: equity.clone(),
             },
         };
         let wins = play_match(&cand, &opp_agent, games, &mut rng);
@@ -670,53 +642,42 @@ mod tests {
     /// same RNG order (one determinization per sim), same enc-derived eval, so
     /// the resulting tree (root child visit counts) is identical. This pins the
     /// batched path to the trusted reference search before any GPU is involved.
-    /// Run both without and with a score-equity table (the table turns round
-    /// boundaries into terminals in both paths identically).
     #[test]
     fn batched_search_matches_run_search_single_holder() {
         let sims = 48;
-        let mut table = ScoreEquity([[0.5f32; 21]; 21]);
-        for i in 0..21 {
-            for j in 0..21 {
-                table.0[i][j] = 0.5 + 0.02 * (i as f32 - j as f32); // score-sensitive, in (0,1)
+        for seed in 0..60u64 {
+            let s = play_some((seed % 17) as usize, seed);
+            if s.phase != Phase::Playing {
+                continue;
             }
-        }
-        for eq in [None, Some(&table)] {
-            for seed in 0..60u64 {
-                let s = play_some((seed % 17) as usize, seed);
-                if s.phase != Phase::Playing {
-                    continue;
+            let searcher = s.awaiting.unwrap();
+
+            // Reference: per-leaf run_search (eval via the enc-derived surrogate).
+            let mut rng_a = StdRng::seed_from_u64(seed ^ 0xABCD);
+            let arena_ref = run_search(&s, searcher, sims, false, &mut rng_a, |st, m| {
+                let (l, v) = dummy_from_enc(&encode(st, m));
+                (l, v as f64)
+            });
+
+            // Batched: one holder, same surrogate applied per row of the batch.
+            let mut rng_b = StdRng::seed_from_u64(seed ^ 0xABCD);
+            let mut holders = vec![Holder { state: &s, searcher, arena: new_root(searcher) }];
+            run_simulations(&mut holders, sims, &mut rng_b, |enc, m| {
+                let mut lo = vec![0f32; m * NUM_CARDS];
+                let mut vo = vec![0f32; m];
+                for r in 0..m {
+                    let (l, v) = dummy_from_enc(&enc[r * INPUT_SIZE..(r + 1) * INPUT_SIZE]);
+                    lo[r * NUM_CARDS..(r + 1) * NUM_CARDS].copy_from_slice(&l);
+                    vo[r] = v;
                 }
-                let searcher = s.awaiting.unwrap();
+                (lo, vo)
+            });
 
-                // Reference: per-leaf run_search (eval via the enc-derived surrogate).
-                let mut rng_a = StdRng::seed_from_u64(seed ^ 0xABCD);
-                let arena_ref = run_search(&s, searcher, sims, false, eq, &mut rng_a, |st, m| {
-                    let (l, v) = dummy_from_enc(&encode(st, m));
-                    (l, v as f64)
-                });
-
-                // Batched: one holder, same surrogate applied per row of the batch.
-                let mut rng_b = StdRng::seed_from_u64(seed ^ 0xABCD);
-                let mut holders = vec![Holder { state: &s, searcher, arena: new_root(searcher) }];
-                run_simulations(&mut holders, sims, eq, &mut rng_b, |enc, m| {
-                    let mut lo = vec![0f32; m * NUM_CARDS];
-                    let mut vo = vec![0f32; m];
-                    for r in 0..m {
-                        let (l, v) = dummy_from_enc(&enc[r * INPUT_SIZE..(r + 1) * INPUT_SIZE]);
-                        lo[r * NUM_CARDS..(r + 1) * NUM_CARDS].copy_from_slice(&l);
-                        vo[r] = v;
-                    }
-                    (lo, vo)
-                });
-
-                assert_eq!(
-                    root_child_visits(&arena_ref),
-                    root_child_visits(&holders[0].arena),
-                    "batched vs run_search visit mismatch (seed {seed}, eq={})",
-                    eq.is_some()
-                );
-            }
+            assert_eq!(
+                root_child_visits(&arena_ref),
+                root_child_visits(&holders[0].arena),
+                "batched vs run_search visit mismatch (seed {seed})"
+            );
         }
     }
 }
