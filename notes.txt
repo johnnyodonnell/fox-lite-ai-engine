@@ -3,12 +3,29 @@
     - Include the full hand history as input into the NN model
     - Train with different model architectures (AWR or NFSP) and see
         if we can outperform our current model
-    - Train with ISMCTS to see if we can outperform our current model
     - NN-assisted determination
         * Michael Buro from University of Alberta and his group used this for Skat
         * Idea from Claude
         * Claude Code mentioned that this bot (https://github.com/JoelNiklaus/JassTheRipper)
             also uses a card prediction (determinization) network
+
+* Approaches tried
+    - ISMCTS + NN
+        * The idea was to match chess-ai-engine's (https://github.com/johnnyodonnell/chess-ai-engine)
+            AlphaZero approach, but we just didn't get very good results
+            from it. The conclusion was that this is not a good approach
+            for this game. And if it is in fact a good approach, we're
+            certainly not implementing it correctly.
+        * We were finding that ISMCTS wasn't adding much value on top
+            of our already trained REINFORCE model. It helped a little
+            but not much. Then, if we trained a model using ISMCTS, that
+            model w/o ISMCTS would actually perform better against
+            itself w/ ISMCTS.
+        * The hardest part about this game is determining where the unknown
+            cards are. Once you can do that, knowing what card to play next
+            is very straightforward, which is different from chess.
+            So the gains that we saw from using search in chess just may
+            not apply here.
 
 
 *******************************************************************************
@@ -27,67 +44,4 @@
         and training crawls.
     - That's the "value hostage" dynamic: the net can only get better through search,
         and search can only help if the net is already decent.
-    - Mechanism: mid-round, almost every simulation terminates at the round boundary,
-        where the backed-up value is just the net's own noisy estimate (RMS error
-        ~0.37 in match-win units) — bigger than the equity margins between candidate
-        moves, so PUCT re-ranks moves by noise. Determinization variance and the
-        frozen single-world bootstrap (defect 1) concentrate that noise instead of
-        averaging it away.
-    - Possible fix: make round-boundary backups exact by applying the known round
-        points and backing up match equity from the new score (defect 2 fix), so
-        search can amplify even while the value head is still mediocre.
-
-* CONCLUSIONS from the search experiments (2026-06-10)
-    - Everything below is from search-vs-raw A/B probes (evaluate_rs --vs /
-        --opp-sims; sims=1 degenerates to argmax of the raw policy), 200 games
-        per match unless noted. "h12" = run3 snapshot at 12h (cold-start
-        AlphaZero+ISMCTS); "snap19" = run1's best REINFORCE net.
-    - Search gain with a LEARNED evaluator caps at ~+30 Elo in this game:
-        * snap19 search-vs-raw: 50 sims 53%, 200 sims ~54% (pooled, 1200
-            games), 800 sims 52.5%; 800-vs-200 head-to-head 48%. The sims
-            ladder is FLAT — the ceiling is evaluator quality, not compute.
-        * h12 search-vs-raw: 200 sims 40-42% (search actively hurts), 800 sims
-            48%. More averaging fixes the variance but converges to the value
-            head's systematic bias — it never crosses 50%.
-    - Structural fixes that were correct but didn't move the probe (all tried,
-        measured, reverted; evidence in the revert commits):
-        * Round-boundary re-eval under the current determinization (defect 1):
-            kept — fixed a real frozen-world bug, +small effect.
-        * Opponent-prior uniform blend 0.7p+0.3/k: pooled 49.8% vs 54.8%
-            baseline — the uniform exploration tax exceeds the starvation cost.
-        * Per-world prior renormalization (softmax over available children):
-            pooled 51.0% vs 53.8% — tail logits for out-of-hand cards are
-            untrained noise; renormalizing amplifies them.
-        * Score-equity table at round boundaries (defect 2): h12 40.0% with
-            vs 42.0% without. Boundary backups only dominate LATE-round
-            searches; early/mid-round searches end at interior leaf evals,
-            which still come from the value head. The value head is the
-            binding constraint, and it has an IRREDUCIBLE noise floor here
-            (hidden hands + future random deals).
-    - Why search was worth +780 Elo in chess (chess-ai-engine README) but only
-        ~+30 here: chess is a calculation game (deterministic deep tactics the
-        static eval cannot see); Fox Lite is an inference game (the hard part
-        is "where are the cards", which forward search over guessed worlds
-        cannot resolve). In-round tactics are ~2 plies; suit/void/trump
-        structure is statically readable by the policy net; many moves are
-        forced or near-equivalent. Low decision density + fuzzy value floor =
-        little for search to add.
-    - VERDICT: the AlphaZero flywheel (search-as-training-amplifier with a
-        learned evaluator) is dead for this game. Cold-start run3 reached only
-        7.5% head-to-head vs snap19 after 13h despite all fixes.
-    - Still alive:
-        * Light play-time search (+~30 Elo) on top of any policy is free
-            strength — strongest current agent is snap19 + ISMCTS.
-        * PIMC with EXACT per-world round solving (alpha-beta + transposition,
-            double-dummy style — Fox Lite rounds are small enough) removes the
-            learned evaluator from search entirely; terminal utility = counted
-            score-equity table. The probe (PIMC vs snap19) measures the game's
-            true search ceiling with a perfect evaluator and decides between
-            "ship/distill PIMC" and "policy-side work is the only path".
-        * Policy-side improvements (the original feature ideas above: hand
-            history input, card-prediction/determinization network, bigger
-            nets, more REINFORCE).
-    - MO-ISMCTS considered and rejected: it fixes opponent-model structure,
-        which two independent experiments showed is not the binding
-        constraint, and it keeps the value-net dependence that is.
 
