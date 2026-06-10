@@ -21,6 +21,7 @@
         * Would be interesting to try, but probably feels less human and
             less fun to play against since it would use the Double
             Dummy for part of its play.
+    - Any of the above already listed but with a bigger net
 
 * Approaches tried
     - ISMCTS + NN
