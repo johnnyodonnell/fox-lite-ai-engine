@@ -27,8 +27,8 @@ exec python orchestrator.py \
   --snapshot-every "${SNAPSHOT_EVERY:-4h}" \
   --sims "${SIMS:-200}" \
   --threads "${THREADS:-16}" \
-  --slots "${SLOTS:-8}" \
-  --selfplay-batch "${SELFPLAY_BATCH:-2048}" \
+  --slots "${SLOTS:-4}" \
+  --selfplay-batch "${SELFPLAY_BATCH:-4096}" \
   --batch-size "${BATCH_SIZE:-256}" \
   --lr "${LR:-2e-3}" \
   --eval-games "${EVAL_GAMES:-200}" \

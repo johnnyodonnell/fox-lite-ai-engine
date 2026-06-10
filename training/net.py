@@ -25,7 +25,7 @@ VALUE_HIDDEN = 256
 # compiled with a STATIC batch (no dynamic_shapes), so the Rust self-play worker
 # must run forwards at exactly this batch (enforced at worker startup by
 # aoti_check_batch in the shim). Keep in sync with --batch / Config::batch.
-SERVING_BATCH = 2048
+SERVING_BATCH = 4096
 
 
 class ResBlock(nn.Module):
