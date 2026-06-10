@@ -86,6 +86,7 @@ struct EvalLeaf {
     leaf_idx: usize,
     det: State,    // the determinization walked to this leaf
     mover: Player, // seat to move at the leaf
+    expand: bool,  // expand the leaf (false for a round-boundary value backprop)
 }
 
 /// Advance every holder's ISMCTS tree by `sims` simulations, batching all leaf
@@ -108,7 +109,7 @@ where
             let e = encode(holders[i].state, holders[i].searcher);
             enc[j * INPUT_SIZE..(j + 1) * INPUT_SIZE].copy_from_slice(&e);
         }
-        let (logits, values) = eval_fn(&enc, need.len());
+        let (logits, _values) = eval_fn(&enc, need.len());
         for (j, &i) in need.iter().enumerate() {
             let searcher = holders[i].searcher;
             expand_node(
@@ -116,7 +117,6 @@ where
                 0,
                 holders[i].state,
                 &logits[j * NUM_CARDS..(j + 1) * NUM_CARDS],
-                values[j] as f64,
                 searcher,
             );
         }
@@ -133,9 +133,12 @@ where
                 WalkResult::Terminal { path, v_ref } => {
                     backprop(&mut holder.arena, &path, v_ref);
                 }
+                WalkResult::BoundaryEval { path, det, mover } => {
+                    leaves.push(EvalLeaf { holder: hi, path, leaf_idx: 0, det, mover, expand: false });
+                }
                 WalkResult::Eval { path, mover } => {
                     let leaf_idx = *path.last().unwrap();
-                    leaves.push(EvalLeaf { holder: hi, path, leaf_idx, det, mover });
+                    leaves.push(EvalLeaf { holder: hi, path, leaf_idx, det, mover, expand: true });
                 }
             }
         }
@@ -151,18 +154,20 @@ where
         }
         let (logits, values) = eval_fn(&enc, leaves.len());
 
-        // Scatter: expand each leaf and backprop its value (searcher POV).
+        // Scatter: expand each leaf (boundary backprops are value-only) and
+        // backprop its value (searcher POV).
         for (j, lf) in leaves.iter().enumerate() {
             let searcher = holders[lf.holder].searcher;
             let value = values[j] as f64;
-            expand_node(
-                &mut holders[lf.holder].arena,
-                lf.leaf_idx,
-                &lf.det,
-                &logits[j * NUM_CARDS..(j + 1) * NUM_CARDS],
-                value,
-                searcher,
-            );
+            if lf.expand {
+                expand_node(
+                    &mut holders[lf.holder].arena,
+                    lf.leaf_idx,
+                    &lf.det,
+                    &logits[j * NUM_CARDS..(j + 1) * NUM_CARDS],
+                    searcher,
+                );
+            }
             let v_ref = if lf.mover == searcher { value } else { -value };
             backprop(&mut holders[lf.holder].arena, &lf.path, v_ref);
         }

@@ -82,6 +82,9 @@ enum GamePhase {
 enum LeafKind {
     RootExpand,
     SimLeaf,
+    /// Round boundary (match not over): backprop the fresh net value of the
+    /// pre-move state under the current determinization; no expansion.
+    Boundary,
 }
 struct LeafCtx {
     kind: LeafKind,
@@ -153,14 +156,21 @@ fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
     let value = res.value as f64;
     match ctx.kind {
         LeafKind::RootExpand => {
-            expand_node(&mut g.arena, 0, &ctx.det, logits, value, g.searcher);
+            expand_node(&mut g.arena, 0, &ctx.det, logits, g.searcher);
             if config.add_root_noise {
                 add_dirichlet_noise(&mut g.arena, 0, &mut g.rng);
             }
             g.phase = GamePhase::Simulating(0);
         }
         LeafKind::SimLeaf => {
-            expand_node(&mut g.arena, ctx.leaf_idx, &ctx.det, logits, value, g.searcher);
+            expand_node(&mut g.arena, ctx.leaf_idx, &ctx.det, logits, g.searcher);
+            let v_ref = if ctx.mover == g.searcher { value } else { -value };
+            backprop(&mut g.arena, &ctx.path, v_ref);
+            if let GamePhase::Simulating(s) = g.phase {
+                g.phase = GamePhase::Simulating(s + 1);
+            }
+        }
+        LeafKind::Boundary => {
             let v_ref = if ctx.mover == g.searcher { value } else { -value };
             backprop(&mut g.arena, &ctx.path, v_ref);
             if let GamePhase::Simulating(s) = g.phase {
@@ -238,6 +248,17 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
                     WalkResult::Terminal { path, v_ref } => {
                         backprop(&mut g.arena, &path, v_ref);
                         g.phase = GamePhase::Simulating(s + 1);
+                    }
+                    WalkResult::BoundaryEval { path, det, mover } => {
+                        g.staged_enc = encode(&det, mover);
+                        g.leaf_ctx = Some(LeafCtx {
+                            kind: LeafKind::Boundary,
+                            path,
+                            leaf_idx: 0, // unused (no expansion)
+                            det,
+                            mover,
+                        });
+                        return Advance::Eval;
                     }
                     WalkResult::Eval { path, mover } => {
                         let leaf_idx = *path.last().unwrap();

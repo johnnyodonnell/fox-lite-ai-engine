@@ -21,9 +21,10 @@
 //!
 //! Search is bounded to the current round: a path that completes the round ends
 //! the simulation. If the round ends the match → terminal value ±1; otherwise the
-//! value is bootstrapped from the net value of the state just before the
-//! round-ending move (the parent node's stored value). So determinization only
-//! ever covers the current round's hidden cards.
+//! value is bootstrapped from a FRESH net eval of the state just before the
+//! round-ending move, under the CURRENT determinization (`WalkResult::BoundaryEval`
+//! — a frozen per-node value would belong to whichever hidden world first expanded
+//! the node). So determinization only ever covers the current round's hidden cards.
 
 use rand::Rng;
 use rand_distr::{Dirichlet, Distribution};
@@ -65,8 +66,7 @@ pub struct Node {
     pub children: Vec<(u8, u32)>, // (canonical card index, child arena idx)
     pub expanded: bool,
     pub noised: bool,
-    pub value_searcher: f64, // net value at this node, searcher POV (for round bootstrap)
-    pub mover: Player,       // seat to move at this node
+    pub mover: Player, // seat to move at this node
 }
 
 impl Node {
@@ -79,7 +79,6 @@ impl Node {
             children: Vec::new(),
             expanded: false,
             noised: false,
-            value_searcher: 0.0,
             mover,
         }
     }
@@ -203,7 +202,12 @@ fn select_child(arena: &mut [Node], node_idx: usize, avail: &[usize], searcher: 
 pub enum WalkResult {
     /// Reached an unexpanded `Playing` node — `det` is left at it; eval + expand.
     Eval { path: Vec<usize>, mover: Player },
-    /// Path resolved (round/match over) without needing a net eval.
+    /// Round ended without ending the match: bootstrap from a net eval of `det`
+    /// (the state just before the round-ending move, under the CURRENT
+    /// determinization, `mover` to play their forced last card). Backprop the
+    /// value (mover POV) along `path`; no node is expanded.
+    BoundaryEval { path: Vec<usize>, det: State, mover: Player },
+    /// Path resolved (match over in-horizon) without needing a net eval.
     Terminal { path: Vec<usize>, v_ref: f64 },
 }
 
@@ -219,6 +223,13 @@ pub fn walk_to_leaf(arena: &mut Vec<Node>, root: usize, det: &mut State, searche
         let (canon, child_idx) =
             select_child(arena, node_idx, &avail, searcher).expect("expanded node with no available child");
         let card = real_card_from_canon_index(canon, det.trump.suit);
+        // Only the trick-13 follow can end the round; keep that pre-move state so
+        // a non-match-ending boundary is re-evaluated under THIS determinization.
+        let pre_move = if det.trick_num == TRICKS_PER_ROUND && det.led_card.is_some() {
+            Some(det.clone())
+        } else {
+            None
+        };
         det.apply(card);
         while det.phase == Phase::TrickComplete {
             det.advance_after_trick();
@@ -233,11 +244,17 @@ pub fn walk_to_leaf(arena: &mut Vec<Node>, root: usize, det: &mut State, searche
                 }
             }
             Phase::RoundOver => {
-                let v_ref = match round_over_outcome(det) {
-                    Some(winner) => if winner == searcher { 1.0 } else { -1.0 },
-                    None => arena[node_idx].value_searcher, // bootstrap: parent's net value
+                return match round_over_outcome(det) {
+                    Some(winner) => {
+                        let v_ref = if winner == searcher { 1.0 } else { -1.0 };
+                        WalkResult::Terminal { path, v_ref }
+                    }
+                    None => WalkResult::BoundaryEval {
+                        path,
+                        det: pre_move.expect("round ended without a trick-13 follow"),
+                        mover,
+                    },
                 };
-                return WalkResult::Terminal { path, v_ref };
             }
             Phase::MatchOver => unreachable!("search never deals a new round"),
             Phase::TrickComplete => unreachable!("trick completion drained above"),
@@ -245,18 +262,16 @@ pub fn walk_to_leaf(arena: &mut Vec<Node>, root: usize, det: &mut State, searche
     }
 }
 
-/// Expand `node_idx`: store its net value (searcher POV) and create a child per
-/// *potential* move with a softmax prior over the net logits.
+/// Expand `node_idx`: create a child per *potential* move with a softmax prior
+/// over the net logits.
 pub fn expand_node(
     arena: &mut Vec<Node>,
     node_idx: usize,
     det: &State,
     logits: &[f32],
-    value: f64,
     searcher: Player,
 ) {
     let mover = arena[node_idx].mover;
-    arena[node_idx].value_searcher = if mover == searcher { value } else { -value };
     let p_canon = potential_canon(det, mover, searcher);
     if !p_canon.is_empty() {
         let maxl = p_canon.iter().map(|&i| logits[i] as f64).fold(f64::NEG_INFINITY, f64::max);
@@ -375,8 +390,8 @@ where
     F: FnMut(&State, Player) -> (Vec<f32>, f64),
 {
     let mut arena = new_root(searcher);
-    let (logits, value) = eval(root_state, searcher);
-    expand_node(&mut arena, 0, root_state, &logits, value, searcher);
+    let (logits, _value) = eval(root_state, searcher);
+    expand_node(&mut arena, 0, root_state, &logits, searcher);
     if add_noise {
         add_dirichlet_noise(&mut arena, 0, rng);
     }
@@ -386,7 +401,12 @@ where
             WalkResult::Eval { path, mover } => {
                 let leaf = *path.last().unwrap();
                 let (logits, value) = eval(&det, mover);
-                expand_node(&mut arena, leaf, &det, &logits, value, searcher);
+                expand_node(&mut arena, leaf, &det, &logits, searcher);
+                let v_ref = if mover == searcher { value } else { -value };
+                backprop(&mut arena, &path, v_ref);
+            }
+            WalkResult::BoundaryEval { path, det, mover } => {
+                let (_logits, value) = eval(&det, mover);
                 let v_ref = if mover == searcher { value } else { -value };
                 backprop(&mut arena, &path, v_ref);
             }
