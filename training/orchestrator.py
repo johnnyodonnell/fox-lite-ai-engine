@@ -93,16 +93,16 @@ def parse_args():
                     help="Warm-start a fresh run from a .pt checkpoint or a raw "
                          ".safetensors snapshot (weights only; fresh clock). Only "
                          "used on cold start (ignored once latest.pt exists).")
-    ap.add_argument("--snapshot-every", default="30m")
+    ap.add_argument("--snapshot-every", default="4h")
     ap.add_argument("--save-latest-every", default="300s")
     ap.add_argument("--publish-every", default="15s",
                     help="How often to republish serving_weights.safetensors "
                          "(the worker hot-reloads it on mtime change).")
     # self-play worker (ISMCTS)
     ap.add_argument("--sims", type=int, default=200)
-    ap.add_argument("--threads", type=int, default=16, help="MCTS worker threads")
-    ap.add_argument("--slots", type=int, default=2, help="GPU forwards in flight")
-    ap.add_argument("--selfplay-batch", type=int, default=512, help="GPU forward width")
+    ap.add_argument("--threads", type=int, default=19, help="MCTS worker threads")
+    ap.add_argument("--slots", type=int, default=4, help="GPU forwards in flight")
+    ap.add_argument("--selfplay-batch", type=int, default=4096, help="GPU forward width")
     ap.add_argument("--queue-max", type=int, default=64)
     # training (AlphaZero supervised: CE(pi) + MSE(z))
     ap.add_argument("--buffer-capacity", type=int, default=2_000_000,
