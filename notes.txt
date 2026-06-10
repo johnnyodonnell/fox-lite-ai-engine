@@ -8,6 +8,13 @@
         * Idea from Claude
         * Claude Code mentioned that this bot (https://github.com/JoelNiklaus/JassTheRipper)
             also uses a card prediction (determinization) network
+        * Generate a probability that the opponent is holding a given card
+            for each unknown card. Then run ISMCTS or PIMC using these
+            probabilities. At trick 1 round 1, the probability will
+            just be an even distribution. If we use PIMC, we can
+            use Double Dummy to completely solve a given world
+            that we're exploring. NN is trained on generating
+            correcet probabilities of unknown cards.
 
 * Approaches tried
     - ISMCTS + NN
