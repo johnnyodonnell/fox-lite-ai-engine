@@ -15,6 +15,9 @@
             use Double Dummy to completely solve a given world
             that we're exploring. NN is trained on generating
             correcet probabilities of unknown cards.
+        * Would fail to play cards that try to sus out what the
+            opponent is holding. It would always just play ideally
+            based on the worlds it samples.
 
 * Approaches tried
     - ISMCTS + NN
