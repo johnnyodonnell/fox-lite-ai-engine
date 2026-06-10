@@ -39,13 +39,6 @@ use crate::{
 pub const C_PUCT: f64 = 1.5;
 pub const DIRICHLET_ALPHA: f64 = 0.6; // higher than chess's 0.3 for Fox-Lite's ≤13 branching
 pub const DIRICHLET_EPS: f64 = 0.25;
-// Opponent-node priors are softmaxed from ONE determinization's net eval, and the
-// policy head puts ~zero mass on cards outside the sampled hand — so children the
-// first sampled hand didn't hold would keep ~zero prior forever and PUCT (whose
-// explore term is prior-multiplied) would starve them even in determinizations
-// where they are legal and strong. Blending toward uniform over the potential set
-// guarantees every child an exploration floor; Q from visits then sorts them out.
-pub const OPP_PRIOR_UNIFORM_EPS: f64 = 0.3;
 pub const TEMP_OPENING: f64 = 1.0; // sampling temperature for the opening of a match
 pub const TEMP_FLOOR: f64 = 0.25; // floor temperature once fully annealed
 pub const TEMP_EARLY_TRICKS: u32 = 13; // match tricks held at the opening temperature (round 1)
@@ -286,11 +279,7 @@ pub fn expand_node(
         let total: f64 = exps.iter().sum();
         let n = p_canon.len() as f64;
         for (k, &canon) in p_canon.iter().enumerate() {
-            let mut prior = if total > 0.0 { exps[k] / total } else { 1.0 / n };
-            if mover != searcher {
-                // see OPP_PRIOR_UNIFORM_EPS: don't trust one sampled hand's softmax
-                prior = (1.0 - OPP_PRIOR_UNIFORM_EPS) * prior + OPP_PRIOR_UNIFORM_EPS / n;
-            }
+            let prior = if total > 0.0 { exps[k] / total } else { 1.0 / n };
             let cm = child_mover_after(det, canon, mover);
             let cidx = arena.len() as u32;
             arena.push(Node::new(prior, cm));
