@@ -197,6 +197,14 @@ h1 {
   max-width: 100%;
 }
 
+/* Not the human's turn: lock the hand so no card can be selected before the
+   opponent has submitted their move. */
+.hand--locked {
+  opacity: 0.55;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
 .hand--bot {
   gap: -16px;
 }
