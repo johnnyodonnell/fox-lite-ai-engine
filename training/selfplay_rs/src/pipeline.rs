@@ -174,7 +174,11 @@ fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
 /// advance the true state to the next decision. Returns true if the match ended.
 fn step_move(g: &mut InFlight) -> bool {
     let temp = temperature(g.state.trick_num);
-    let pi = visits_to_pi(&g.arena, 0, temp);
+    // Policy target: RAW visit proportions (AlphaZero). The annealed temperature
+    // applies only to move *selection* below — sharpening the stored target too
+    // (visits^(1/temp)) discards the search's soft information and feeds an
+    // overconfidence loop through the PUCT prior term.
+    let pi = visits_to_pi(&g.arena, 0, 1.0);
     let state_enc = encode(&g.state, g.searcher);
     g.decisions.push(Decision { state_enc, pi, seat: g.searcher });
 
