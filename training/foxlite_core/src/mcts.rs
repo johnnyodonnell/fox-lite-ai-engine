@@ -59,7 +59,6 @@ pub fn temperature(round_num: u32, trick_num: u32) -> f64 {
 
 pub struct Node {
     pub prior: f64,
-    pub logit: f32, // expansion-time net logit for the edge into this node
     pub visit_count: u32,
     pub value_sum: f64, // searcher POV
     pub avail_count: u32,
@@ -73,7 +72,6 @@ impl Node {
     pub fn new(prior: f64, mover: Player) -> Node {
         Node {
             prior,
-            logit: 0.0,
             visit_count: 0,
             value_sum: 0.0,
             avail_count: 0,
@@ -221,36 +219,6 @@ fn select_child(arena: &mut [Node], node_idx: usize, avail: &[bool; NUM_CARDS], 
             arena[ci as usize].avail_count += 1;
         }
     }
-    // Opponent-node priors are renormalized PER WORLD: a softmax of the expansion
-    // logits over only the currently-available children. The stored priors are
-    // normalized over the full potential set, conditioned on the one hand sampled
-    // at expansion — in determinizations that mismatch it, the available children's
-    // stored mass collapses toward zero, starving exploration (frozen-first-world
-    // bias). Renormalizing keeps the net's relative preferences among the moves
-    // this world actually allows, at full strength. Searcher nodes keep stored
-    // priors: their child set is path-determined (avail == all children, so the
-    // renorm would be an identity) and the root's Dirichlet noise lives there.
-    let renorm = mover != searcher;
-    let mut maxl = f64::NEG_INFINITY;
-    let mut inv_total = 0.0f64;
-    if renorm {
-        for k in 0..n_children {
-            let (canon, ci) = arena[node_idx].children[k];
-            if avail[canon as usize] {
-                maxl = maxl.max(arena[ci as usize].logit as f64);
-            }
-        }
-        let mut total = 0.0f64;
-        for k in 0..n_children {
-            let (canon, ci) = arena[node_idx].children[k];
-            if avail[canon as usize] {
-                total += ((arena[ci as usize].logit as f64) - maxl).exp();
-            }
-        }
-        if total > 0.0 {
-            inv_total = 1.0 / total;
-        }
-    }
     let mut best: Option<(usize, usize)> = None;
     let mut best_score = f64::NEG_INFINITY;
     for k in 0..n_children {
@@ -259,14 +227,9 @@ fn select_child(arena: &mut [Node], node_idx: usize, avail: &[bool; NUM_CARDS], 
             continue;
         }
         let c = &arena[ci as usize];
-        let prior = if renorm {
-            ((c.logit as f64) - maxl).exp() * inv_total
-        } else {
-            c.prior
-        };
         let exploit = sign * c.q();
         let explore =
-            C_PUCT * prior * (c.avail_count.max(1) as f64).sqrt() / (1.0 + c.visit_count as f64);
+            C_PUCT * c.prior * (c.avail_count.max(1) as f64).sqrt() / (1.0 + c.visit_count as f64);
         let score = exploit + explore;
         if score > best_score {
             best_score = score;
@@ -372,9 +335,7 @@ pub fn expand_node(
             let prior = if total > 0.0 { exps[k] / total } else { 1.0 / n };
             let cm = child_mover_after(det, canon, mover);
             let cidx = arena.len() as u32;
-            let mut child = Node::new(prior, cm);
-            child.logit = logits[canon]; // for per-world prior renorm (opponent nodes)
-            arena.push(child);
+            arena.push(Node::new(prior, cm));
             arena[node_idx].children.push((canon as u8, cidx));
         }
     }
