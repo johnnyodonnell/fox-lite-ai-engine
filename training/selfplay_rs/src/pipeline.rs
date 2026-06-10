@@ -37,7 +37,7 @@ use rand::SeedableRng;
 use tch::{Device, Kind, Tensor};
 
 use foxlite_core::determinize::determinize;
-use foxlite_core::encode::{encode, real_card_from_canon_index, INPUT_SIZE};
+use foxlite_core::encode::{encode, encode_into, real_card_from_canon_index, INPUT_SIZE};
 use foxlite_core::mcts::{
     add_dirichlet_noise, backprop, expand_node, new_root, sample_move, temperature, visits_to_pi,
     walk_to_leaf, Node, WalkResult,
@@ -226,7 +226,7 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
     loop {
         match g.phase {
             GamePhase::NeedRootExpand => {
-                g.staged_enc = encode(&g.state, g.searcher);
+                encode_into(&g.state, g.searcher, &mut g.staged_enc);
                 g.leaf_ctx = Some(LeafCtx {
                     kind: LeafKind::RootExpand,
                     path: vec![0],
@@ -250,7 +250,7 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
                         g.phase = GamePhase::Simulating(s + 1);
                     }
                     WalkResult::BoundaryEval { path, det, mover } => {
-                        g.staged_enc = encode(&det, mover);
+                        encode_into(&det, mover, &mut g.staged_enc);
                         g.leaf_ctx = Some(LeafCtx {
                             kind: LeafKind::Boundary,
                             path,
@@ -262,7 +262,7 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
                     }
                     WalkResult::Eval { path, mover } => {
                         let leaf_idx = *path.last().unwrap();
-                        g.staged_enc = encode(&det, mover);
+                        encode_into(&det, mover, &mut g.staged_enc);
                         g.leaf_ctx = Some(LeafCtx {
                             kind: LeafKind::SimLeaf,
                             path,

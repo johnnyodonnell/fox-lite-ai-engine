@@ -104,7 +104,17 @@ pub fn opponent_voids(state: &State, opponent: Player) -> [bool; NUM_SUITS] {
 
 /// Encode `state` from `mover`'s perspective into a length-`INPUT_SIZE` vector.
 pub fn encode(state: &State, mover: Player) -> Vec<f32> {
-    let mut out = vec![0.0f32; INPUT_SIZE];
+    let mut out = Vec::new();
+    encode_into(state, mover, &mut out);
+    out
+}
+
+/// [`encode`] into a caller-owned buffer (cleared and re-zeroed), reusing its
+/// capacity — the self-play pipeline encodes one leaf per simulation, so a fresh
+/// per-leaf Vec was a top malloc-churn source.
+pub fn encode_into(state: &State, mover: Player, out: &mut Vec<f32>) {
+    out.clear();
+    out.resize(INPUT_SIZE, 0.0);
     let trump = state.trump.suit;
     let opp = mover.other();
 
@@ -164,7 +174,6 @@ pub fn encode(state: &State, mover: Player) -> Vec<f32> {
     cur += SCORE_SLOTS;
 
     debug_assert_eq!(cur, INPUT_SIZE);
-    out
 }
 
 /// Canonical legal-move mask (length `NUM_CARDS`) for `mover`.

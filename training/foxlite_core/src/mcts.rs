@@ -173,16 +173,25 @@ fn round_over_outcome(state: &State) -> Option<Player> {
 fn select_child(arena: &mut [Node], node_idx: usize, avail: &[usize], searcher: Player) -> Option<(usize, usize)> {
     let mover = arena[node_idx].mover;
     let sign = if mover == searcher { 1.0 } else { -1.0 };
-    let children = arena[node_idx].children.clone();
-    for &(canon, ci) in &children {
-        if avail.contains(&(canon as usize)) {
+    let mut avail_mask = [false; NUM_CARDS];
+    for &a in avail {
+        avail_mask[a] = true;
+    }
+    // Iterate children by index: bumping a child's avail_count needs &mut arena
+    // while the parent's child list is read, and this runs every step of every
+    // simulation — cloning the list here was a top malloc-churn source.
+    let n_children = arena[node_idx].children.len();
+    for k in 0..n_children {
+        let (canon, ci) = arena[node_idx].children[k];
+        if avail_mask[canon as usize] {
             arena[ci as usize].avail_count += 1;
         }
     }
     let mut best: Option<(usize, usize)> = None;
     let mut best_score = f64::NEG_INFINITY;
-    for &(canon, ci) in &children {
-        if !avail.contains(&(canon as usize)) {
+    for k in 0..n_children {
+        let (canon, ci) = arena[node_idx].children[k];
+        if !avail_mask[canon as usize] {
             continue;
         }
         let c = &arena[ci as usize];
@@ -275,8 +284,11 @@ pub fn expand_node(
     let p_canon = potential_canon(det, mover, searcher);
     if !p_canon.is_empty() {
         let maxl = p_canon.iter().map(|&i| logits[i] as f64).fold(f64::NEG_INFINITY, f64::max);
-        let exps: Vec<f64> = p_canon.iter().map(|&i| ((logits[i] as f64) - maxl).exp()).collect();
-        let total: f64 = exps.iter().sum();
+        let mut exps = [0.0f64; NUM_CARDS];
+        for (k, &i) in p_canon.iter().enumerate() {
+            exps[k] = ((logits[i] as f64) - maxl).exp();
+        }
+        let total: f64 = exps[..p_canon.len()].iter().sum();
         let n = p_canon.len() as f64;
         for (k, &canon) in p_canon.iter().enumerate() {
             let prior = if total > 0.0 { exps[k] / total } else { 1.0 / n };
