@@ -9,35 +9,44 @@ supervised AlphaZero training — no advantage, no entropy bonus, no legal mask
 (the target already has zero mass on illegal moves).
 """
 
-import collections
-
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 
 class ReplayBuffer:
-    """Ring buffer of (state, pi, z) tuples."""
+    """Ring buffer of (state, pi, z) rows in preallocated numpy arrays (a deque's
+    O(n) random indexing makes sampling at multi-million capacity prohibitive)."""
 
     def __init__(self, capacity):
         self.capacity = capacity
-        self.buf = collections.deque(maxlen=capacity)
+        self.states = None  # allocated on first add, from the row shapes
+        self.pis = None
+        self.zs = np.empty(capacity, dtype=np.float32)
+        self.next = 0
+        self.size = 0
 
     def add_many(self, tuples):
-        self.buf.extend(tuples)
+        for state, pi, z in tuples:
+            if self.states is None:
+                self.states = np.empty((self.capacity, len(state)), dtype=np.float32)
+                self.pis = np.empty((self.capacity, len(pi)), dtype=np.float32)
+            i = self.next
+            self.states[i] = state
+            self.pis[i] = pi
+            self.zs[i] = z
+            self.next = (i + 1) % self.capacity
+            self.size = min(self.size + 1, self.capacity)
 
     def __len__(self):
-        return len(self.buf)
+        return self.size
 
     def sample(self, batch_size, rng=None):
         rng = rng or np.random
-        if len(self.buf) == 0:
+        if self.size == 0:
             return None
-        idxs = rng.choice(len(self.buf), size=batch_size, replace=True)
-        states = np.stack([self.buf[i][0] for i in idxs])
-        pis = np.stack([self.buf[i][1] for i in idxs])
-        zs = np.array([self.buf[i][2] for i in idxs], dtype=np.float32)
-        return states, pis, zs
+        idxs = rng.choice(self.size, size=batch_size, replace=True)
+        return self.states[idxs], self.pis[idxs], self.zs[idxs]
 
 
 def train_step(net, opt, batch, device, *, grad_clip=1.0):

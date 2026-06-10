@@ -99,7 +99,10 @@ def parse_args():
     ap.add_argument("--selfplay-batch", type=int, default=512, help="GPU forward width")
     ap.add_argument("--queue-max", type=int, default=64)
     # training (AlphaZero supervised: CE(pi) + MSE(z))
-    ap.add_argument("--buffer-capacity", type=int, default=200_000)
+    ap.add_argument("--buffer-capacity", type=int, default=2_000_000,
+                    help="Replay window in rows (~1KB each). Must span hours of "
+                         "self-play / many model versions for stable AlphaZero "
+                         "training; 200k was ~80s of data at live throughput.")
     ap.add_argument("--min-buffer-for-train", type=int, default=2_000)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--target-reuse", type=float, default=4.0,
