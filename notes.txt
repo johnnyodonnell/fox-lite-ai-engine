@@ -7,4 +7,6 @@
     - NN-assisted determination
         * Michael Buro from University of Alberta and his group used this for Skat
         * Idea from Claude
+        * Claude Code mentioned that this bot (https://github.com/JoelNiklaus/JassTheRipper)
+            also uses a card prediction (determinization) network
 
