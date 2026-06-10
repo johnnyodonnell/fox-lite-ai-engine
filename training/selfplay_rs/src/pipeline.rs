@@ -44,6 +44,7 @@ use foxlite_core::mcts::{
 };
 use foxlite_core::{Phase, Player, State, NUM_CARDS};
 
+use crate::aoti::AotiModel;
 use crate::cuda_event::CudaEvent;
 use crate::net::Net;
 
@@ -61,6 +62,7 @@ pub struct Config {
     pub n_slots: usize, // GPU forwards kept in flight (inference runs ahead of scatter)
     pub batch: usize,   // GPU forward width
     pub weights_path: String,
+    pub model_path: String, // AOTInductor .pt2 (fused forward); empty -> eager tch forward
     pub reload_every: Duration,
     pub cpu: bool,
 }
@@ -403,10 +405,37 @@ struct WorkItem {
     games: Vec<Box<InFlight>>,
 }
 
-/// Owns the tch net on the inference thread; reloads weights in place on mtime
-/// change (the trainer republishes the safetensors sidecar atomically).
+/// The forward backend: the eager tch net (CPU / no `--model`), or the fused
+/// AOTInductor `.pt2` (CUDA + `--model`). Both consume bf16 input on CUDA and
+/// return bf16 outputs; the launch path narrows/widens identically for either.
+enum Backend {
+    Tch(Net),
+    Aoti(AotiModel),
+}
+
+/// Push the safetensors sidecar's weights into the loaded AOTI package in place
+/// (no recompile). Constants are keyed by the MANGLED FQN ('.'->'_'); tensors go
+/// to CUDA bf16. Returns false on a transient read error (retried next tick).
+fn aoti_swap(model: &AotiModel, weights_path: &str, dev: Device) -> bool {
+    let entries = match Tensor::read_safetensors(weights_path) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut names: Vec<std::ffi::CString> = Vec::with_capacity(entries.len());
+    let mut tensors: Vec<Tensor> = Vec::with_capacity(entries.len());
+    for (name, t) in entries {
+        names.push(std::ffi::CString::new(name.replace('.', "_")).unwrap());
+        tensors.push(t.to_device(dev).to_kind(Kind::BFloat16));
+    }
+    let refs: Vec<&Tensor> = tensors.iter().collect();
+    model.swap_weights(&names, &refs);
+    true
+}
+
+/// Owns the forward backend on the inference thread; reloads weights in place on
+/// mtime change (the trainer republishes the safetensors sidecar atomically).
 struct Infer {
-    net: Net,
+    backend: Backend,
     dev: Device,
     kind: Kind, // forward dtype: bf16 on CUDA (tensor cores + half the memory traffic), fp32 on CPU
     weights_path: String,
@@ -416,12 +445,32 @@ struct Infer {
 }
 impl Infer {
     fn new(config: &Config, dev: Device) -> Infer {
-        // The forward is dominated by fp32 sgemm (memory-bound, no tensor cores);
-        // bf16 halves the H2D + weight/activation traffic and uses tensor cores.
-        // CPU bf16 is slow/uneven, so the CPU fallback stays fp32.
+        // The forward is dominated by matmul; bf16 uses tensor cores + halves the
+        // H2D/activation traffic. CPU bf16 is slow/uneven, so CPU stays fp32.
         let kind = if matches!(dev, Device::Cuda(_)) { Kind::BFloat16 } else { Kind::Float };
+        let use_aoti = !config.model_path.is_empty() && matches!(dev, Device::Cuda(_));
+        let backend = if use_aoti {
+            // Loaded ONCE; the .pt2 bakes export-time weights, so swap in the current
+            // sidecar before the first forward (and on every publish via maybe_reload).
+            let model = AotiModel::load(&config.model_path);
+            match model.check_batch(config.batch as i64, ENC_LEN as i64) {
+                0 => {}
+                code => {
+                    eprintln!(
+                        "FATAL: {} not compiled for batch={} (aoti_check_batch={code}); \
+                         re-export the .pt2 at this batch (SERVING_BATCH in net.py)",
+                        config.model_path, config.batch
+                    );
+                    std::process::exit(1);
+                }
+            }
+            aoti_swap(&model, &config.weights_path, dev);
+            Backend::Aoti(model)
+        } else {
+            Backend::Tch(Net::load(&config.weights_path, dev, kind))
+        };
         Infer {
-            net: Net::load(&config.weights_path, dev, kind),
+            backend,
             dev,
             kind,
             last_mtime: std::fs::metadata(&config.weights_path).and_then(|m| m.modified()).ok(),
@@ -439,7 +488,14 @@ impl Infer {
         if m.is_none() || m == self.last_mtime {
             return;
         }
-        self.net.reload(&self.weights_path); // copies fresh weights in place
+        match &self.backend {
+            Backend::Tch(net) => net.reload(&self.weights_path), // copies fresh weights in place
+            Backend::Aoti(model) => {
+                if !aoti_swap(model, &self.weights_path, self.dev) {
+                    return; // transient read; keep last_mtime so we retry next tick
+                }
+            }
+        }
         self.last_mtime = m;
     }
     /// Launch one async forward over `m` staged encodings; returns the GPU output
@@ -451,7 +507,19 @@ impl Infer {
             .reshape([m as i64, ENC_LEN as i64])
             .to_kind(self.kind)
             .to_device(self.dev);
-        let (logits, values) = self.net.forward(&x);
+        let (logits, values) = match &self.backend {
+            Backend::Tch(net) => net.forward(&x),
+            Backend::Aoti(model) => {
+                // Fresh output tensors per launch (not static buffers), so the scatter
+                // thread can read these while the next forward runs — same overlap as
+                // the eager path. AOTI is static-batch, so m must equal config.batch
+                // (guaranteed: gather() only returns full batches).
+                let out_l = Tensor::zeros([m as i64, POLICY_SIZE as i64], (self.kind, self.dev));
+                let out_v = Tensor::zeros([m as i64], (self.kind, self.dev));
+                model.run(&x, &out_l, &out_v);
+                (out_l, out_v)
+            }
+        };
         let logits = logits.to_kind(Kind::Float);
         let values = values.to_kind(Kind::Float);
         let event = CudaEvent::new();

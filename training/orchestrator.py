@@ -112,6 +112,8 @@ def parse_args():
     ap.add_argument("--log-every", type=float, default=30.0)
     # evaluation (ISMCTS)
     ap.add_argument("--no-eval", action="store_true")
+    ap.add_argument("--no-aoti", action="store_true",
+                    help="disable the fused AOTInductor self-play forward (use eager bf16)")
     ap.add_argument("--eval-games", type=int, default=200, help="matches per opponent")
     ap.add_argument("--eval-sims", type=int, default=200,
                     help="ISMCTS eval is synchronous (batch-1); at a full opponent "
@@ -120,6 +122,23 @@ def parse_args():
     ap.add_argument("--n-top", type=int, default=2)
     ap.add_argument("--n-anchors", type=int, default=3)
     return ap.parse_args()
+
+
+def export_serving_pt2(net, path, batch, device):
+    """Export a COPY of `net` to an AOTInductor .pt2 (fused, bf16, STATIC batch) for
+    the self-play worker's forward. Exported once; the worker hot-swaps fresh weights
+    from the safetensors sidecar, so only the architecture/batch need to be right.
+    Never mutates the training net (works on a fresh FoxNet copy)."""
+    import torch._inductor  # lazily, so a torch without inductor still trains (eager)
+    m = FoxNet()
+    m.load_state_dict(net.state_dict())  # copy current weights (cast to the copy)
+    m.eval().to(device).bfloat16()
+    x = torch.zeros(batch, INPUT_SIZE, device=device, dtype=torch.bfloat16)
+    # Keep constants runtime-updatable so the worker can swap weights with no recompile.
+    torch._inductor.config.aot_inductor.use_runtime_constant_folding = True
+    with torch.no_grad():
+        ep = torch.export.export(m, (x,))
+        torch._inductor.aoti_compile_and_package(ep, package_path=str(path))
 
 
 def main():
@@ -168,6 +187,20 @@ def main():
 
     serving_st = out_dir / "serving_weights.safetensors"
     save_weights_st(net, str(serving_st))  # initial weights for the first self-play
+
+    # Export the fused AOTInductor forward once; the worker loads it and hot-swaps
+    # fresh weights on each publish. On any failure, fall back to the eager bf16 path.
+    serving_model = None
+    if not args.no_aoti and device.type == "cuda":
+        serving_model = out_dir / "serving_model.pt2"
+        try:
+            t0 = time.time()
+            export_serving_pt2(net, serving_model, args.selfplay_batch, device)
+            print(f"exported AOTI {serving_model.name} (batch={args.selfplay_batch}) "
+                  f"in {time.time() - t0:.1f}s", flush=True)
+        except Exception as e:
+            print(f"WARNING: AOTI export failed ({e}); using eager bf16 forward", flush=True)
+            serving_model = None
 
     start = time.time()
 
@@ -262,20 +295,23 @@ def main():
         if not SELFPLAY_BIN.exists():
             raise SystemExit(f"self-play binary not found: {SELFPLAY_BIN} "
                              f"(build it: cd selfplay_rs && cargo build --release)")
+        cmd = [str(SELFPLAY_BIN), "serve",
+               "--weights", str(serving_st),
+               "--threads", str(args.threads),
+               "--sims", str(args.sims),
+               "--slots", str(args.slots),
+               "--batch", str(args.selfplay_batch),
+               "--seed", str(args.seed + 1000)]
+        if serving_model is not None:
+            cmd += ["--model", str(serving_model)]
         proc = subprocess.Popen(
-            [str(SELFPLAY_BIN), "serve",
-             "--weights", str(serving_st),
-             "--threads", str(args.threads),
-             "--sims", str(args.sims),
-             "--slots", str(args.slots),
-             "--batch", str(args.selfplay_batch),
-             "--seed", str(args.seed + 1000)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=worker_env(),
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=worker_env(),
         )
         t = threading.Thread(target=reader_loop, args=(proc.stdout,), daemon=True)
         t.start()
-        print(f"spawned selfplay_rs worker pid={proc.pid} "
-              f"(threads={args.threads} sims={args.sims} batch={args.selfplay_batch})", flush=True)
+        fwd = "AOTI" if serving_model is not None else "eager-bf16"
+        print(f"spawned selfplay_rs worker pid={proc.pid} ({fwd}; "
+              f"threads={args.threads} sims={args.sims} batch={args.selfplay_batch})", flush=True)
         return proc
 
     selfplay_proc = start_selfplay()

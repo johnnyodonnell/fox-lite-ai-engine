@@ -21,6 +21,12 @@ N_BLOCKS = 4
 POLICY_SIZE = NUM_CARDS  # 33
 VALUE_HIDDEN = 256
 
+# GPU batch width the AOTInductor serving_model.pt2 is exported at. The package is
+# compiled with a STATIC batch (no dynamic_shapes), so the Rust self-play worker
+# must run forwards at exactly this batch (enforced at worker startup by
+# aoti_check_batch in the shim). Keep in sync with --batch / Config::batch.
+SERVING_BATCH = 2048
+
 
 class ResBlock(nn.Module):
     def __init__(self, width: int):

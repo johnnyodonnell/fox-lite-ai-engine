@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use tch::{Device, Kind, Tensor};
 
+use selfplay_rs::aoti::AotiModel;
 use selfplay_rs::net::Net;
 use selfplay_rs::pipeline;
+use selfplay_rs::pipeline::{ENC_LEN, POLICY_SIZE};
 
 /// Read a `--key value` flag, falling back to `default`.
 fn flag(args: &[String], key: &str, default: &str) -> String {
@@ -31,6 +33,7 @@ fn parse_pipeline_config(args: &[String]) -> pipeline::Config {
         n_slots: flag(args, "--slots", "2").parse().unwrap(),
         batch: flag(args, "--batch", "512").parse().unwrap(),
         weights_path: flag(args, "--weights", "serving_weights.safetensors"),
+        model_path: flag(args, "--model", ""),
         reload_every: Duration::from_millis(flag(args, "--reload-ms", "2000").parse().unwrap()),
         cpu: args.iter().any(|a| a == "--cpu"),
     }
@@ -99,10 +102,103 @@ fn forward_check(dir: &str) -> bool {
     cpu_ok && gpu_ok
 }
 
+/// Parity gate for the AOTInductor path: compare the fused `.pt2` forward (run via
+/// the C++ shim) against the eager tch bf16 forward on the same random input. Both
+/// are bf16, so this isolates fusion/accumulation-order noise from the C++ link/run
+/// path being correct. Returns true if they agree within the bf16 sanity bound.
+fn aoti_check(weights: &str, model: &str, batch: i64) -> bool {
+    if !tch::Cuda::is_available() {
+        println!("aoti-check: CUDA unavailable — skipping");
+        return true;
+    }
+    let dev = Device::Cuda(0);
+    let x = Tensor::randn([batch, ENC_LEN as i64], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+
+    // Eager bf16 reference.
+    let net = Net::load(weights, dev, Kind::BFloat16);
+    let (ref_l, ref_v) = net.forward(&x);
+
+    // Fused AOTI forward via the shim.
+    let aoti = AotiModel::load(model);
+    match aoti.check_batch(batch, ENC_LEN as i64) {
+        0 => {}
+        code => {
+            println!("aoti-check: FAIL — {model} not compiled for batch={batch} (check_batch={code})");
+            return false;
+        }
+    }
+    let out_l = Tensor::zeros([batch, POLICY_SIZE as i64], (Kind::BFloat16, dev));
+    let out_v = Tensor::zeros([batch], (Kind::BFloat16, dev));
+    aoti.run(&x, &out_l, &out_v);
+
+    let dl = max_abs_diff(&out_l, &ref_l);
+    let dv = max_abs_diff(&out_v, &ref_v);
+    println!("aoti-check on batch={batch}:");
+    println!("  AOTI vs eager bf16:  max|Δlogits|={dl:.3e}  max|Δvalue|={dv:.3e}");
+    // Both paths are bf16; only fusion/accumulation order differs. Loose sanity bound.
+    let ok = dl < 2e-1 && dv < 1e-1;
+    println!("{}", if ok { "AOTI-CHECK OK" } else { "AOTI-CHECK FAILED" });
+    ok
+}
+
+/// Verify the in-place weight hot-swap path: load a `.pt2` (built from some other
+/// weights), push the weights from `w2` via `swap_weights`, and confirm the fused
+/// forward now matches the EAGER forward of `w2`. If the mangled constant names did
+/// not match, the swap would silently no-op and AOTI would NOT match net(w2) — so
+/// this catches a broken hot-reload (which would otherwise train on stale weights).
+fn aoti_swap_check(model: &str, w2: &str, batch: i64) -> bool {
+    if !tch::Cuda::is_available() {
+        println!("aoti-swap-check: CUDA unavailable — skipping");
+        return true;
+    }
+    let dev = Device::Cuda(0);
+    let aoti = AotiModel::load(model);
+    if aoti.check_batch(batch, ENC_LEN as i64) != 0 {
+        println!("aoti-swap-check: FAIL — {model} not compiled for batch={batch}");
+        return false;
+    }
+    // Push w2's weights into the loaded package (mangled FQN '.'->'_', bf16 CUDA).
+    let entries = Tensor::read_safetensors(w2).expect("read w2 safetensors");
+    let mut names: Vec<std::ffi::CString> = Vec::with_capacity(entries.len());
+    let mut tensors: Vec<Tensor> = Vec::with_capacity(entries.len());
+    for (name, t) in entries {
+        names.push(std::ffi::CString::new(name.replace('.', "_")).unwrap());
+        tensors.push(t.to_device(dev).to_kind(Kind::BFloat16));
+    }
+    let refs: Vec<&Tensor> = tensors.iter().collect();
+    aoti.swap_weights(&names, &refs);
+
+    let x = Tensor::randn([batch, ENC_LEN as i64], (Kind::Float, dev)).to_kind(Kind::BFloat16);
+    let out_l = Tensor::zeros([batch, POLICY_SIZE as i64], (Kind::BFloat16, dev));
+    let out_v = Tensor::zeros([batch], (Kind::BFloat16, dev));
+    aoti.run(&x, &out_l, &out_v);
+
+    let (ref_l, ref_v) = Net::load(w2, dev, Kind::BFloat16).forward(&x);
+    let dl = max_abs_diff(&out_l, &ref_l);
+    let dv = max_abs_diff(&out_v, &ref_v);
+    println!("aoti-swap-check on batch={batch} (swapped in {w2}):");
+    println!("  AOTI(after swap) vs eager bf16(w2):  max|Δlogits|={dl:.3e}  max|Δvalue|={dv:.3e}");
+    let ok = dl < 2e-1 && dv < 1e-1;
+    println!("{}", if ok { "AOTI-SWAP-CHECK OK" } else { "AOTI-SWAP-CHECK FAILED (stale weights!)" });
+    ok
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("");
     match cmd {
+        "aoti-swap-check" => {
+            let model = flag(&args, "--model", "serving_model.pt2");
+            let w2 = flag(&args, "--w2", "serving_weights.safetensors");
+            let batch: i64 = flag(&args, "--batch", "2048").parse().unwrap();
+            std::process::exit(if aoti_swap_check(&model, &w2, batch) { 0 } else { 1 });
+        }
+        "aoti-check" => {
+            let weights = flag(&args, "--weights", "serving_weights.safetensors");
+            let model = flag(&args, "--model", "serving_model.pt2");
+            let batch: i64 = flag(&args, "--batch", "2048").parse().unwrap();
+            std::process::exit(if aoti_check(&weights, &model, batch) { 0 } else { 1 });
+        }
         "forward-check" => {
             let dir = args.get(2).map(String::as_str).unwrap_or(".");
             let ok = forward_check(dir);
