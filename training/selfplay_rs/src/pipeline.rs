@@ -173,7 +173,7 @@ fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
 /// Pick the real move from the finished search, record the decision, play it, and
 /// advance the true state to the next decision. Returns true if the match ended.
 fn step_move(g: &mut InFlight) -> bool {
-    let temp = temperature(g.state.trick_num);
+    let temp = temperature(g.state.round_num, g.state.trick_num);
     // Policy target: RAW visit proportions (AlphaZero). The annealed temperature
     // applies only to move *selection* below — sharpening the stored target too
     // (visits^(1/temp)) discards the search's soft information and feeds an
