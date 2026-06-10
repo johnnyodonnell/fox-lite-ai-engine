@@ -36,7 +36,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tch::{Device, Kind, Tensor};
 
-use foxlite_core::determinize::determinize;
+use foxlite_core::determinize::determinize_into;
 use foxlite_core::encode::{encode, encode_into, real_card_from_canon_index, INPUT_SIZE};
 use foxlite_core::mcts::{
     add_dirichlet_noise, backprop, expand_node, new_root, sample_move, temperature, visits_to_pi,
@@ -88,9 +88,7 @@ enum LeafKind {
 }
 struct LeafCtx {
     kind: LeafKind,
-    path: Vec<usize>,
     leaf_idx: usize,
-    det: State,    // determinized state at the leaf (clone of the true state for the root)
     mover: Player, // seat to move at the leaf
 }
 struct EvalResult {
@@ -114,6 +112,11 @@ struct InFlight {
     phase: GamePhase,
     pending: Option<EvalResult>,
     leaf_ctx: Option<LeafCtx>,
+    // Per-game scratch reused across simulations (a game stages exactly one leaf
+    // at a time, so one of each suffices; clone_from keeps their heap buffers).
+    det: State,           // walk determinization (mutated to the leaf)
+    leaf_det: State,      // leaf/boundary/root state preserved across the GPU roundtrip
+    path: Vec<usize>,     // walk path of the in-flight leaf (backprop target)
     staged_enc: Vec<f32>, // encoding of the leaf currently awaiting a forward
 }
 
@@ -125,6 +128,8 @@ fn spawn_fresh(shared: &Shared) -> InFlight {
     let searcher = state.awaiting.expect("fresh match awaits a leader");
     InFlight {
         id,
+        det: state.clone(),
+        leaf_det: state.clone(),
         state,
         searcher,
         arena: new_root(searcher),
@@ -133,6 +138,7 @@ fn spawn_fresh(shared: &Shared) -> InFlight {
         phase: GamePhase::NeedRootExpand,
         pending: None,
         leaf_ctx: None,
+        path: Vec::new(),
         staged_enc: Vec::new(),
     }
 }
@@ -156,23 +162,23 @@ fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
     let value = res.value as f64;
     match ctx.kind {
         LeafKind::RootExpand => {
-            expand_node(&mut g.arena, 0, &ctx.det, logits, g.searcher);
+            expand_node(&mut g.arena, 0, &g.leaf_det, logits, g.searcher);
             if config.add_root_noise {
                 add_dirichlet_noise(&mut g.arena, 0, &mut g.rng);
             }
             g.phase = GamePhase::Simulating(0);
         }
         LeafKind::SimLeaf => {
-            expand_node(&mut g.arena, ctx.leaf_idx, &ctx.det, logits, g.searcher);
+            expand_node(&mut g.arena, ctx.leaf_idx, &g.leaf_det, logits, g.searcher);
             let v_ref = if ctx.mover == g.searcher { value } else { -value };
-            backprop(&mut g.arena, &ctx.path, v_ref);
+            backprop(&mut g.arena, &g.path, v_ref);
             if let GamePhase::Simulating(s) = g.phase {
                 g.phase = GamePhase::Simulating(s + 1);
             }
         }
         LeafKind::Boundary => {
             let v_ref = if ctx.mover == g.searcher { value } else { -value };
-            backprop(&mut g.arena, &ctx.path, v_ref);
+            backprop(&mut g.arena, &g.path, v_ref);
             if let GamePhase::Simulating(s) = g.phase {
                 g.phase = GamePhase::Simulating(s + 1);
             }
@@ -211,7 +217,8 @@ fn step_move(g: &mut InFlight) -> bool {
         return true;
     }
     g.searcher = g.state.awaiting.expect("next decision awaits a mover");
-    g.arena = new_root(g.searcher);
+    g.arena.clear(); // fresh root, arena Vec capacity kept
+    g.arena.push(Node::new(0.0, g.searcher));
     g.phase = GamePhase::NeedRootExpand;
     false
 }
@@ -227,11 +234,10 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
         match g.phase {
             GamePhase::NeedRootExpand => {
                 encode_into(&g.state, g.searcher, &mut g.staged_enc);
+                g.leaf_det.clone_from(&g.state);
                 g.leaf_ctx = Some(LeafCtx {
                     kind: LeafKind::RootExpand,
-                    path: vec![0],
                     leaf_idx: 0,
-                    det: g.state.clone(),
                     mover: g.searcher,
                 });
                 return Advance::Eval;
@@ -243,31 +249,32 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
                     }
                     continue;
                 }
-                let mut det = determinize(&g.state, g.searcher, &mut g.rng);
-                match walk_to_leaf(&mut g.arena, 0, &mut det, g.searcher) {
-                    WalkResult::Terminal { path, v_ref } => {
-                        backprop(&mut g.arena, &path, v_ref);
+                determinize_into(&g.state, g.searcher, &mut g.rng, &mut g.det);
+                match walk_to_leaf(&mut g.arena, 0, &mut g.det, g.searcher, &mut g.path, &mut g.leaf_det) {
+                    WalkResult::Terminal { v_ref } => {
+                        backprop(&mut g.arena, &g.path, v_ref);
                         g.phase = GamePhase::Simulating(s + 1);
                     }
-                    WalkResult::BoundaryEval { path, det, mover } => {
-                        encode_into(&det, mover, &mut g.staged_enc);
+                    WalkResult::BoundaryEval { mover } => {
+                        // walk_to_leaf left the pre-move boundary state in leaf_det
+                        encode_into(&g.leaf_det, mover, &mut g.staged_enc);
                         g.leaf_ctx = Some(LeafCtx {
                             kind: LeafKind::Boundary,
-                            path,
                             leaf_idx: 0, // unused (no expansion)
-                            det,
                             mover,
                         });
                         return Advance::Eval;
                     }
-                    WalkResult::Eval { path, mover } => {
-                        let leaf_idx = *path.last().unwrap();
-                        encode_into(&det, mover, &mut g.staged_enc);
+                    WalkResult::Eval { mover } => {
+                        let leaf_idx = *g.path.last().unwrap();
+                        // Preserve the leaf's determinization across the GPU
+                        // roundtrip (expand_node needs it); g.det is overwritten
+                        // by the next simulation's determinize_into.
+                        std::mem::swap(&mut g.det, &mut g.leaf_det);
+                        encode_into(&g.leaf_det, mover, &mut g.staged_enc);
                         g.leaf_ctx = Some(LeafCtx {
                             kind: LeafKind::SimLeaf,
-                            path,
                             leaf_idx,
-                            det,
                             mover,
                         });
                         return Advance::Eval;

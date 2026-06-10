@@ -44,19 +44,44 @@ pub fn unseen_cards(state: &State, searcher: Player) -> Vec<Card> {
 /// are the remainder and are never referenced during play, so we don't store
 /// them).
 pub fn determinize<R: Rng + ?Sized>(state: &State, searcher: Player, rng: &mut R) -> State {
+    let mut out = state.clone();
+    determinize_into(state, searcher, rng, &mut out);
+    out
+}
+
+/// [`determinize`] into a caller-owned scratch `State`, reusing its heap buffers
+/// (`clone_from`) — the self-play pipeline determinizes once per simulation, and
+/// the fresh `State` (3 Vec clones) plus unseen/free/hand Vecs per call were a
+/// top malloc-churn source. Draws the same RNG sequence as the original.
+pub fn determinize_into<R: Rng + ?Sized>(state: &State, searcher: Player, rng: &mut R, out: &mut State) {
     let opp = searcher.other();
     let opp_count = state.hand(opp).len();
     let voids = opponent_voids(state, opp);
 
-    // Split the unseen pool into cards forced into the unused pile (opponent-void
-    // suits) and freely assignable cards.
+    // Unseen pool, split into cards forced into the unused pile (opponent-void
+    // suits) and freely assignable cards — fused with the seen-mask scan so no
+    // intermediate Vec is built (cf. `unseen_cards`).
+    let mut seen = [false; NUM_CARDS];
+    for c in state.hand(searcher) {
+        seen[c.index()] = true;
+    }
+    for ev in &state.trick_history {
+        seen[ev.card.index()] = true;
+    }
+    seen[state.trump.index()] = true;
+    let mut free = [Card::new(0, 1); NUM_CARDS];
+    let mut n_free = 0usize;
     let mut forced_unused = 0usize;
-    let mut free: Vec<Card> = Vec::with_capacity(opp_count + 6);
-    for c in unseen_cards(state, searcher) {
+    for i in 0..NUM_CARDS {
+        if seen[i] {
+            continue;
+        }
+        let c = Card::from_index(i);
         if voids[c.suit as usize] {
             forced_unused += 1;
         } else {
-            free.push(c);
+            free[n_free] = c;
+            n_free += 1;
         }
     }
     debug_assert!(forced_unused <= 6, "void-suit cards cannot exceed the 6-card unused pile");
@@ -64,17 +89,17 @@ pub fn determinize<R: Rng + ?Sized>(state: &State, searcher: Player, rng: &mut R
     // The unused pile takes `forced_unused` void cards plus `6 - forced_unused`
     // free cards; the remaining `opp_count` free cards become the opponent hand.
     let n_unused_free = 6 - forced_unused;
-    fisher_yates(&mut free, rng);
-    let mut opp_hand: Vec<Card> = free.split_off(n_unused_free);
-    debug_assert_eq!(opp_hand.len(), opp_count, "opponent hand size mismatch");
-    crate::sort_hand(&mut opp_hand);
+    fisher_yates(&mut free[..n_free], rng);
+    debug_assert_eq!(n_free - n_unused_free, opp_count, "opponent hand size mismatch");
 
-    let mut s = state.clone();
-    match opp {
-        Player::Human => s.human_hand = opp_hand,
-        Player::Bot => s.bot_hand = opp_hand,
-    }
-    s
+    out.clone_from(state);
+    let opp_hand = match opp {
+        Player::Human => &mut out.human_hand,
+        Player::Bot => &mut out.bot_hand,
+    };
+    opp_hand.clear();
+    opp_hand.extend_from_slice(&free[n_unused_free..n_free]);
+    crate::sort_hand(opp_hand);
 }
 
 fn fisher_yates<R: Rng + ?Sized>(xs: &mut [Card], rng: &mut R) {

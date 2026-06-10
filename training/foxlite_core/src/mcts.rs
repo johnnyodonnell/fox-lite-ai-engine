@@ -29,11 +29,10 @@
 use rand::Rng;
 use rand_distr::{Dirichlet, Distribution};
 
-use crate::determinize::unseen_cards;
 use crate::encode::{canon_card_index, real_card_from_canon_index};
 use crate::{
-    legal_moves, score_for_tricks, trick_winner, Phase, Player, Side, State, NUM_CARDS,
-    TARGET_SCORE, TRICKS_PER_ROUND,
+    score_for_tricks, trick_winner, Card, Phase, Player, Side, State, NUM_CARDS, TARGET_SCORE,
+    TRICKS_PER_ROUND,
 };
 
 pub const C_PUCT: f64 = 1.5;
@@ -96,32 +95,69 @@ pub fn new_root(searcher: Player) -> Vec<Node> {
     vec![Node::new(0.0, searcher)]
 }
 
-/// Canonical indices legal for `mover` in `state` *right now* (this determinization).
-fn legal_canon(state: &State, mover: Player) -> Vec<usize> {
-    legal_moves(state.hand(mover), state.led_card)
-        .iter()
-        .map(|c| canon_card_index(*c, state.trump.suit))
-        .collect()
+/// Mask over canonical slots of the moves legal for `mover` in `state` *right
+/// now* (this determinization). Mirrors `legal_moves` (must follow suit if able)
+/// without allocating; equivalence is pinned by a test.
+fn legal_canon_mask(state: &State, mover: Player) -> [bool; NUM_CARDS] {
+    let mut mask = [false; NUM_CARDS];
+    let trump = state.trump.suit;
+    let hand = state.hand(mover);
+    if let Some(led) = state.led_card {
+        let mut any_same = false;
+        for c in hand {
+            if c.suit == led.suit {
+                mask[canon_card_index(*c, trump)] = true;
+                any_same = true;
+            }
+        }
+        if any_same {
+            return mask;
+        }
+    }
+    for c in hand {
+        mask[canon_card_index(*c, trump)] = true;
+    }
+    mask
 }
 
 /// Determinization-independent *potential* child set at a node (a superset of the
-/// union over determinizations of the mover's legal moves):
+/// union over determinizations of the mover's legal moves), written into `out`
+/// (returns the count):
 ///   - searcher node: the searcher's exact legal moves (public, deterministic);
 ///   - opponent node: *every* unseen card. We can't follow-suit-filter here — a
 ///     determinization that makes the opponent void in the led suit lets it play
 ///     off-suit, so any unseen card may become legal. Over-included cards that are
 ///     never legal in any determinization simply stay at zero availability and are
 ///     never selected.
-fn potential_canon(state: &State, mover: Player, searcher: Player) -> Vec<usize> {
-    let cards = if mover == searcher {
-        legal_moves(state.hand(searcher), state.led_card)
+fn potential_canon(state: &State, mover: Player, searcher: Player, out: &mut [usize; NUM_CARDS]) -> usize {
+    let trump = state.trump.suit;
+    let mut n = 0;
+    if mover == searcher {
+        let mask = legal_canon_mask(state, mover);
+        for (ci, &legal) in mask.iter().enumerate() {
+            if legal {
+                out[n] = ci;
+                n += 1;
+            }
+        }
     } else {
-        unseen_cards(state, searcher)
-    };
-    cards
-        .iter()
-        .map(|c| canon_card_index(*c, state.trump.suit))
-        .collect()
+        // Inline `unseen_cards` over a seen-mask (no intermediate Vec).
+        let mut seen = [false; NUM_CARDS];
+        for c in state.hand(searcher) {
+            seen[c.index()] = true;
+        }
+        for ev in &state.trick_history {
+            seen[ev.card.index()] = true;
+        }
+        seen[state.trump.index()] = true;
+        for (i, &s) in seen.iter().enumerate() {
+            if !s {
+                out[n] = canon_card_index(Card::from_index(i), trump);
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// Seat to move after `mover` plays `canon` from `state` (placeholder for a
@@ -170,20 +206,16 @@ fn round_over_outcome(state: &State) -> Option<Player> {
 
 /// Bump availability for every currently-legal child, then pick the max-PUCT one.
 /// Returns `(canonical idx, child arena idx)`.
-fn select_child(arena: &mut [Node], node_idx: usize, avail: &[usize], searcher: Player) -> Option<(usize, usize)> {
+fn select_child(arena: &mut [Node], node_idx: usize, avail: &[bool; NUM_CARDS], searcher: Player) -> Option<(usize, usize)> {
     let mover = arena[node_idx].mover;
     let sign = if mover == searcher { 1.0 } else { -1.0 };
-    let mut avail_mask = [false; NUM_CARDS];
-    for &a in avail {
-        avail_mask[a] = true;
-    }
     // Iterate children by index: bumping a child's avail_count needs &mut arena
     // while the parent's child list is read, and this runs every step of every
     // simulation — cloning the list here was a top malloc-churn source.
     let n_children = arena[node_idx].children.len();
     for k in 0..n_children {
         let (canon, ci) = arena[node_idx].children[k];
-        if avail_mask[canon as usize] {
+        if avail[canon as usize] {
             arena[ci as usize].avail_count += 1;
         }
     }
@@ -191,7 +223,7 @@ fn select_child(arena: &mut [Node], node_idx: usize, avail: &[usize], searcher: 
     let mut best_score = f64::NEG_INFINITY;
     for k in 0..n_children {
         let (canon, ci) = arena[node_idx].children[k];
-        if !avail_mask[canon as usize] {
+        if !avail[canon as usize] {
             continue;
         }
         let c = &arena[ci as usize];
@@ -208,37 +240,47 @@ fn select_child(arena: &mut [Node], node_idx: usize, avail: &[usize], searcher: 
 }
 
 /// Outcome of descending one simulation through the (re-determinized) tree.
+/// The visited node path is in the caller's `path` buffer.
 pub enum WalkResult {
     /// Reached an unexpanded `Playing` node — `det` is left at it; eval + expand.
-    Eval { path: Vec<usize>, mover: Player },
-    /// Round ended without ending the match: bootstrap from a net eval of `det`
-    /// (the state just before the round-ending move, under the CURRENT
-    /// determinization, `mover` to play their forced last card). Backprop the
-    /// value (mover POV) along `path`; no node is expanded.
-    BoundaryEval { path: Vec<usize>, det: State, mover: Player },
+    Eval { mover: Player },
+    /// Round ended without ending the match: bootstrap from a net eval of the
+    /// caller's `boundary` buffer (the state just before the round-ending move,
+    /// under the CURRENT determinization, `mover` to play their forced last
+    /// card). Backprop the value (mover POV) along `path`; no node is expanded.
+    BoundaryEval { mover: Player },
     /// Path resolved (match over in-horizon) without needing a net eval.
-    Terminal { path: Vec<usize>, v_ref: f64 },
+    Terminal { v_ref: f64 },
 }
 
 /// Descend from `root` over the determinized `det`, applying selected moves, until
 /// an unexpanded `Playing` leaf or a round/match-over terminal. Mutates `det`
-/// (plays moves) and `arena` (availability counts).
-pub fn walk_to_leaf(arena: &mut Vec<Node>, root: usize, det: &mut State, searcher: Player) -> WalkResult {
-    let mut path = vec![root];
+/// (plays moves) and `arena` (availability counts). The visited path is written
+/// into `path` and a `BoundaryEval` pre-move state into `boundary` — caller-owned
+/// scratch buffers so a hot caller pays no per-simulation allocations.
+pub fn walk_to_leaf(
+    arena: &mut Vec<Node>,
+    root: usize,
+    det: &mut State,
+    searcher: Player,
+    path: &mut Vec<usize>,
+    boundary: &mut State,
+) -> WalkResult {
+    path.clear();
+    path.push(root);
     let mut node_idx = root;
     loop {
         let mover = det.awaiting.expect("walk at a non-decision phase");
-        let avail = legal_canon(det, mover);
+        let avail = legal_canon_mask(det, mover);
         let (canon, child_idx) =
             select_child(arena, node_idx, &avail, searcher).expect("expanded node with no available child");
         let card = real_card_from_canon_index(canon, det.trump.suit);
         // Only the trick-13 follow can end the round; keep that pre-move state so
         // a non-match-ending boundary is re-evaluated under THIS determinization.
-        let pre_move = if det.trick_num == TRICKS_PER_ROUND && det.led_card.is_some() {
-            Some(det.clone())
-        } else {
-            None
-        };
+        let at_boundary = det.trick_num == TRICKS_PER_ROUND && det.led_card.is_some();
+        if at_boundary {
+            boundary.clone_from(det);
+        }
         det.apply(card);
         while det.phase == Phase::TrickComplete {
             det.advance_after_trick();
@@ -249,20 +291,17 @@ pub fn walk_to_leaf(arena: &mut Vec<Node>, root: usize, det: &mut State, searche
                 if arena[child_idx].expanded {
                     node_idx = child_idx;
                 } else {
-                    return WalkResult::Eval { path, mover: det.awaiting.unwrap() };
+                    return WalkResult::Eval { mover: det.awaiting.unwrap() };
                 }
             }
             Phase::RoundOver => {
+                debug_assert!(at_boundary, "round ended without a trick-13 follow");
                 return match round_over_outcome(det) {
                     Some(winner) => {
                         let v_ref = if winner == searcher { 1.0 } else { -1.0 };
-                        WalkResult::Terminal { path, v_ref }
+                        WalkResult::Terminal { v_ref }
                     }
-                    None => WalkResult::BoundaryEval {
-                        path,
-                        det: pre_move.expect("round ended without a trick-13 follow"),
-                        mover,
-                    },
+                    None => WalkResult::BoundaryEval { mover },
                 };
             }
             Phase::MatchOver => unreachable!("search never deals a new round"),
@@ -281,7 +320,9 @@ pub fn expand_node(
     searcher: Player,
 ) {
     let mover = arena[node_idx].mover;
-    let p_canon = potential_canon(det, mover, searcher);
+    let mut p_buf = [0usize; NUM_CARDS];
+    let n_potential = potential_canon(det, mover, searcher, &mut p_buf);
+    let p_canon = &p_buf[..n_potential];
     if !p_canon.is_empty() {
         let maxl = p_canon.iter().map(|&i| logits[i] as f64).fold(f64::NEG_INFINITY, f64::max);
         let mut exps = [0.0f64; NUM_CARDS];
@@ -407,22 +448,25 @@ where
     if add_noise {
         add_dirichlet_noise(&mut arena, 0, rng);
     }
+    let mut det = root_state.clone();
+    let mut path: Vec<usize> = Vec::new();
+    let mut boundary = root_state.clone();
     for _ in 0..sims {
-        let mut det = crate::determinize::determinize(root_state, searcher, rng);
-        match walk_to_leaf(&mut arena, 0, &mut det, searcher) {
-            WalkResult::Eval { path, mover } => {
+        crate::determinize::determinize_into(root_state, searcher, rng, &mut det);
+        match walk_to_leaf(&mut arena, 0, &mut det, searcher, &mut path, &mut boundary) {
+            WalkResult::Eval { mover } => {
                 let leaf = *path.last().unwrap();
                 let (logits, value) = eval(&det, mover);
                 expand_node(&mut arena, leaf, &det, &logits, searcher);
                 let v_ref = if mover == searcher { value } else { -value };
                 backprop(&mut arena, &path, v_ref);
             }
-            WalkResult::BoundaryEval { path, det, mover } => {
-                let (_logits, value) = eval(&det, mover);
+            WalkResult::BoundaryEval { mover } => {
+                let (_logits, value) = eval(&boundary, mover);
                 let v_ref = if mover == searcher { value } else { -value };
                 backprop(&mut arena, &path, v_ref);
             }
-            WalkResult::Terminal { path, v_ref } => backprop(&mut arena, &path, v_ref),
+            WalkResult::Terminal { v_ref } => backprop(&mut arena, &path, v_ref),
         }
     }
     arena
@@ -487,6 +531,23 @@ mod tests {
             assert!(mask[mv] != 0.0, "sampled illegal move (seed {seed})");
             let best = sample_move(&arena, 0, 0.0, &mut rng);
             assert!(mask[best] != 0.0, "argmax illegal move (seed {seed})");
+        }
+    }
+
+    #[test]
+    fn legal_canon_mask_matches_legal_moves() {
+        for seed in 0..200u64 {
+            let s = play_some((seed % 23) as usize, seed);
+            if s.phase != Phase::Playing {
+                continue;
+            }
+            let mover = s.awaiting.unwrap();
+            let mask = legal_canon_mask(&s, mover);
+            let mut expect = [false; NUM_CARDS];
+            for c in crate::legal_moves(s.hand(mover), s.led_card) {
+                expect[canon_card_index(c, s.trump.suit)] = true;
+            }
+            assert_eq!(mask, expect, "mask diverges from legal_moves (seed {seed})");
         }
     }
 

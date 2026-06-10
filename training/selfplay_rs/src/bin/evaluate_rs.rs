@@ -126,19 +126,21 @@ where
         // Gather one leaf per holder over a fresh determinization. Terminal
         // paths backprop immediately; non-terminals are staged for the forward.
         let mut leaves: Vec<EvalLeaf> = Vec::with_capacity(holders.len());
+        let mut path: Vec<usize> = Vec::new();
         for (hi, holder) in holders.iter_mut().enumerate() {
             let searcher = holder.searcher;
             let mut det = determinize(holder.state, searcher, rng);
-            match walk_to_leaf(&mut holder.arena, 0, &mut det, searcher) {
-                WalkResult::Terminal { path, v_ref } => {
+            let mut boundary = holder.state.clone();
+            match walk_to_leaf(&mut holder.arena, 0, &mut det, searcher, &mut path, &mut boundary) {
+                WalkResult::Terminal { v_ref } => {
                     backprop(&mut holder.arena, &path, v_ref);
                 }
-                WalkResult::BoundaryEval { path, det, mover } => {
-                    leaves.push(EvalLeaf { holder: hi, path, leaf_idx: 0, det, mover, expand: false });
+                WalkResult::BoundaryEval { mover } => {
+                    leaves.push(EvalLeaf { holder: hi, path: path.clone(), leaf_idx: 0, det: boundary, mover, expand: false });
                 }
-                WalkResult::Eval { path, mover } => {
+                WalkResult::Eval { mover } => {
                     let leaf_idx = *path.last().unwrap();
-                    leaves.push(EvalLeaf { holder: hi, path, leaf_idx, det, mover, expand: true });
+                    leaves.push(EvalLeaf { holder: hi, path: path.clone(), leaf_idx, det, mover, expand: true });
                 }
             }
         }
