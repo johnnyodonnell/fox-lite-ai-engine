@@ -10,3 +10,25 @@
         * Claude Code mentioned that this bot (https://github.com/JoelNiklaus/JassTheRipper)
             also uses a card prediction (determinization) network
 
+* Why ISMCTS search may not work for this game
+    - The flywheel only spins if search beats the raw net. The whole premise of
+        AlphaZero-style training is a loop: the search uses the net to produce moves
+        better than the net's raw output, those better moves generate better games,
+        those games become training targets, the net improves, repeat. Search is the
+        amplifier in that loop.
+    - But our A/B showed the amplifier is currently doing nothing: run3 with search
+        scored 44/100 against its own raw policy. Search isn't improving on the net,
+        so the self-play data is no better than what the policy alone would produce,
+        and training crawls.
+    - That's the "value hostage" dynamic: the net can only get better through search,
+        and search can only help if the net is already decent.
+    - Mechanism: mid-round, almost every simulation terminates at the round boundary,
+        where the backed-up value is just the net's own noisy estimate (RMS error
+        ~0.37 in match-win units) — bigger than the equity margins between candidate
+        moves, so PUCT re-ranks moves by noise. Determinization variance and the
+        frozen single-world bootstrap (defect 1) concentrate that noise instead of
+        averaging it away.
+    - Possible fix: make round-boundary backups exact by applying the known round
+        points and backing up match equity from the new score (defect 2 fix), so
+        search can amplify even while the value head is still mediocre.
+
