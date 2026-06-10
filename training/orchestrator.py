@@ -57,6 +57,12 @@ def worker_env() -> dict:
     libs = [torch_lib] + sorted(glob.glob(os.path.join(sp, "nvidia", "*", "lib")))
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = ":".join(libs) + ":" + env.get("LD_LIBRARY_PATH", "")
+    # libtorch's intra-op OpenMP pool defaults to nproc threads that busy-spin
+    # at barriers between forwards, stealing cores from the MCTS worker threads
+    # (the forward itself runs on the GPU). Cap it: +15% self-play games/sec
+    # together with --threads 19 (A/B benched 2026-06-09 on the GB10 box).
+    env["OMP_NUM_THREADS"] = "1"
+    env["OMP_WAIT_POLICY"] = "PASSIVE"
     return env
 
 

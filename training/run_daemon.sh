@@ -26,7 +26,7 @@ exec python orchestrator.py \
   --out-dir "${OUT_DIR:-runs/run3}" \
   --snapshot-every "${SNAPSHOT_EVERY:-4h}" \
   --sims "${SIMS:-200}" \
-  --threads "${THREADS:-16}" \
+  --threads "${THREADS:-19}" \
   --slots "${SLOTS:-4}" \
   --selfplay-batch "${SELFPLAY_BATCH:-4096}" \
   --batch-size "${BATCH_SIZE:-256}" \
