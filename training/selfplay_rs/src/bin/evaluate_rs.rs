@@ -454,6 +454,33 @@ fn main() {
         Device::Cpu
     };
 
+    // One-off A/B mode: --vs <safetensors|random> plays candidate (--sims) against
+    // a single opponent (--opp-sims, default --sims) and prints the result without
+    // touching pool.json. sims=1 degenerates to argmax of the raw policy (one
+    // simulation visits the max-prior child), so `--opp-sims 1` is "search off".
+    let vs = flag(&args, "--vs", "");
+    if !vs.is_empty() {
+        let opp_sims: usize = flag(&args, "--opp-sims", &sims.to_string()).parse().unwrap();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let cand_name = snapshot_stem(&candidate);
+        let cand = Agent::Net {
+            net: Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float),
+            sims,
+        };
+        let opp_agent = if vs == RANDOM {
+            Agent::Random
+        } else {
+            Agent::Net { net: Net::load(&vs, dev, Kind::Float), sims: opp_sims }
+        };
+        let wins = play_match(&cand, &opp_agent, games, &mut rng);
+        println!(
+            "[ab] {cand_name} (sims={sims}) vs {} (sims={opp_sims}): {wins}/{games} ({:.1}%)",
+            snapshot_stem(Path::new(&vs)),
+            100.0 * wins as f64 / games.max(1) as f64
+        );
+        return;
+    }
+
     let pool_path = run_dir.join("pool.json");
     let mut pool = load_pool(&pool_path);
     let mut rng = StdRng::seed_from_u64(seed);
