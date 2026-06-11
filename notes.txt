@@ -1,7 +1,7 @@
 
 * Feature ideas
     - Include the full hand history as input into the NN model
-    - Train with different model architectures (AWR or NFSP) and see
+    - Train with different model architectures (e.g. NFSP) and see
         if we can outperform our current model
     - NN-assisted determination
         * Michael Buro from University of Alberta and his group used this for Skat
@@ -43,6 +43,14 @@
             is very straightforward, which is different from chess.
             So the gains that we saw from using search in chess just may
             not apply here.
+    - AWR
+        * Did not have much success here
+        * This was suggested early in our project, which is why it was tried
+        * It was also appealing because the model could be trained off-policy,
+            but we just didn't get any good results from this approach
+        * After some research, we couldn't find any examples that used this
+            approach for training self-play game engines. The examples
+            we found were mainly used for robotics.
 
 
 *******************************************************************************
