@@ -440,6 +440,7 @@ struct WorkItem {
     logits: Tensor, // GPU [m, 33]
     // The value head is unused by search-free self-play; the tensor is carried
     // only to keep it alive until the event sync (same stream as the logits).
+    #[allow(dead_code)]
     values: Tensor, // GPU [m]
     event: CudaEvent,
     games: Vec<Box<InFlight>>,
