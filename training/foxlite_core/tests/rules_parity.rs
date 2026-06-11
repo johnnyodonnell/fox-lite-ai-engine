@@ -138,15 +138,8 @@ fn rules_match_js() {
             "game {gi}: final score mismatch"
         );
         let expected_winner = parse_player(&game.winner);
-        // Mirror `State::match_winner`: higher total wins; a tie on total points
-        // is broken by the final round's points (which can never tie).
-        let hl = foxlite_core::score_for_tricks(last.tricks_won.human);
-        let bl = foxlite_core::score_for_tricks(last.tricks_won.bot);
-        let winner = if game.final_score.human > game.final_score.bot {
-            Player::Human
-        } else if game.final_score.bot > game.final_score.human {
-            Player::Bot
-        } else if hl > bl {
+        let winner = if game.final_score.human >= 21 && game.final_score.human >= game.final_score.bot
+        {
             Player::Human
         } else {
             Player::Bot

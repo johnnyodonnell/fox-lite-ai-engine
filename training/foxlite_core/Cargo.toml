@@ -6,7 +6,6 @@ description = "Pure Fox in the Forest Lite rules + canonical NN encoding (no tor
 
 [dependencies]
 rand = "0.8"
-rand_distr = "0.4"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

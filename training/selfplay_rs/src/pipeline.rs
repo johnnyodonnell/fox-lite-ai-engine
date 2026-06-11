@@ -1,689 +1,403 @@
-//! Continuous ISMCTS self-play pipeline (100% Rust, leaf-batched).
+//! Parallel self-play cohort generation: N game-worker threads + a single
+//! batched-inference thread, decoupled by two queues.
 //!
-//! Port of the chess-ai-engine pipeline topology onto Fox-Lite, with the heavy
-//! inference stack (AOTI / CUDA-graph / bf16 / pinned slots) swapped for the
-//! simple `tch` fp32 `Net::forward` — the Fox-Lite net is tiny, so a plain forward
-//! keeps the GPU fed and the code small.
+//! The baseline `selfplay::run` is single-threaded: it drives every game's
+//! rules logic (encode / sample / apply) serially on one CPU thread between
+//! batched GPU forwards, so the GPU sits ~70% idle (CPU-bound). This module
+//! parallelizes the rules logic across `n_threads` workers and overlaps it with
+//! the GPU forward, keeping the device fed.
 //!
-//! Topology:
-//!   - N worker threads each drive one game's ISMCTS FSM until it yields ONE leaf
-//!     to evaluate (root expand or a simulation leaf) or the game finishes (rows
-//!     streamed to the sink). Workers claim scattered games in small chunks from
-//!     the ply-bucketed return queue, highest ply first — the fast lane that keeps
-//!     nearly-finished games finishing and the completion stream smooth. An empty
-//!     return queue => spawn a fresh game (dynamic game count, self-regulating to
-//!     fill the pipe);
-//!   - ONE bounded ply-priority pre-inference queue (most real-moves-made first),
-//!     so games closest to finishing are evaluated soonest;
-//!   - ONE inference thread: gathers BATCH leaf encodings, runs the fp32 forward,
-//!     records a CUDA event, hands the in-flight forward to the scatter thread,
-//!     and loops to launch the next batch. It also mtime-polls the weights sidecar
-//!     and `Net::reload`s in place between batches (weight hot-reload);
-//!   - ONE scatter thread: waits the event, reads (logits, value) back to the
-//!     host, attaches each game's result, and bulk-pushes the batch back into the
-//!     return queue.
+//! Topology (search-free fox-lite — each decision needs exactly ONE forward):
+//!   - workers own no torch; they advance a game's FSM until it yields ONE
+//!     decision to evaluate (encode the state, push to the pre-inference queue)
+//!     or the match ends (finalize rows -> sink). An empty ready queue with
+//!     budget left => spawn a fresh game (concurrency self-regulates);
+//!   - ONE pre-inference queue (bounded VecDeque + condvars): workers push
+//!     staged encodings, the inference thread pops up to BATCH at a time;
+//!   - ONE inference thread: gathers a batch off the pre-inference queue, runs
+//!     the net forward, copies logits back to the host, attaches each game's
+//!     logit row as its `pending` result, and requeues the games on the ready
+//!     queue for a worker to sample + apply.
 //!
-//! Both shared queues are ply-bucketed (one Vec per ply count), NOT comparison
-//! heaps: push is O(1) and bulk drains move whole buckets, so every lock hold is
-//! tiny. The previous global Mutex<BinaryHeap> pair spent ~40% of worker on-CPU
-//! time in lock machinery (the 4096-pop gather hold convoyed all workers every
-//! batch).
-//!
-//! Each ISMCTS decision re-determinizes the hidden cards every simulation (true
-//! ISMCTS); the leaf-batching means a single game contributes ~`sims` forwards per
-//! move, all interleaved with every other in-flight game's forwards.
+//! Output is byte-identical in layout to `selfplay::run` (same `write_cohort`),
+//! so the Python trainer consumes it unchanged.
 
-use std::io::{self, BufWriter, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tch::{Device, Kind, Tensor};
 
-use foxlite_core::determinize::determinize_into;
-use foxlite_core::encode::{encode, encode_into, real_card_from_canon_index, INPUT_SIZE};
-use foxlite_core::mcts::{
-    add_dirichlet_noise, backprop, expand_node, new_root, sample_move, temperature, visits_to_pi,
-    walk_to_leaf, Node, WalkResult,
-};
+use foxlite_core::encode::{encode, legal_mask, real_card_from_canon_index, INPUT_SIZE};
 use foxlite_core::{Phase, Player, State, NUM_CARDS};
 
-use crate::aoti::AotiModel;
 use crate::cuda_event::CudaEvent;
 use crate::net::Net;
-
-pub const ENC_LEN: usize = INPUT_SIZE; // 230
-pub const POLICY_SIZE: usize = NUM_CARDS; // 33
-
-/// One finished-game training row: (state[230], pi[33], z).
-pub type Row = (Vec<f32>, [f32; NUM_CARDS], f32);
+use crate::selfplay::{sample_action, write_cohort};
 
 pub struct Config {
-    pub sims: usize,
-    pub add_root_noise: bool,
+    pub weights: String,
+    pub out: String,
+    pub matches: usize,
+    pub batch: usize,       // GPU forward width (max rows per forward)
+    pub concurrency: usize, // games kept in flight; > batch overlaps CPU with GPU
+    pub n_threads: usize,   // game-worker threads
+    pub slots: usize,       // forwards in flight (inference can run ahead of scatter)
+    pub temperature: f64,
     pub seed: u64,
-    pub n_threads: usize,
-    pub n_slots: usize, // GPU forwards kept in flight (inference runs ahead of scatter)
-    pub batch: usize,   // GPU forward width
-    pub weights_path: String,
-    pub model_path: String, // AOTInductor .pt2 (fused forward); empty -> eager tch forward
-    pub reload_every: Duration,
     pub cpu: bool,
 }
 
-// --- per-game seeding (splitmix64; determinism not required, just spread) ---
+/// One recorded decision; flushed to the cohort with z = ±1 when the match ends.
+struct Decision {
+    state: Vec<f32>,
+    mask: [f32; NUM_CARDS],
+    action: u32,
+    seat: Player,
+}
+
+/// A game in flight through the pipeline.
+struct InFlight {
+    state: State,
+    decisions: Vec<Decision>,
+    rng: StdRng,
+    staged_enc: Vec<f32>, // encoding of the decision currently awaiting a forward
+    staged_mover: Player, // seat to move at that decision
+    // Forward result: the whole batch's logits (shared, one alloc per forward)
+    // plus this game's row in it. The worker slices its own row when sampling —
+    // no per-game copy on the serial inference thread.
+    pending: Option<(Arc<Vec<f32>>, usize)>,
+}
+
+/// Per-worker tallies, merged once at join (keeps the cohort rows and counters
+/// off the shared ready-lock — only the in-flight bookkeeping is shared).
+#[derive(Default)]
+struct WorkerOut {
+    rows: Vec<f32>,
+    finished: usize,
+    wins: [u64; 2],
+    total_decisions: u64,
+}
+
+// --- per-game seeding (splitmix64; just a deterministic spread per game id) ---
 fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
 }
 
-// --- per-game ISMCTS FSM ------------------------------------------------------
-enum GamePhase {
-    NeedRootExpand,
-    Simulating(usize),
-}
-enum LeafKind {
-    RootExpand,
-    SimLeaf,
-    /// Round boundary (match not over): backprop the fresh net value of the
-    /// pre-move state under the current determinization; no expansion.
-    Boundary,
-}
-struct LeafCtx {
-    kind: LeafKind,
-    leaf_idx: usize,
-    mover: Player, // seat to move at the leaf
-}
-struct EvalResult {
-    logits: Arc<Vec<f32>>, // whole batch's policy [m * 33]; the worker slices its row
-    row: usize,
-    value: f32,
-}
-/// One recorded decision; flushed to a row with z = ±1 when the match ends.
-struct Decision {
-    state_enc: Vec<f32>,
-    pi: [f32; NUM_CARDS],
-    seat: Player,
-}
-struct InFlight {
-    state: State,     // the TRUE match state
-    searcher: Player, // seat to move at the current decision (= state.awaiting)
-    arena: Vec<Node>, // ISMCTS tree for the current decision
-    rng: StdRng,
-    decisions: Vec<Decision>,
-    phase: GamePhase,
-    pending: Option<EvalResult>,
-    leaf_ctx: Option<LeafCtx>,
-    // Per-game scratch reused across simulations (a game stages exactly one leaf
-    // at a time, so one of each suffices; clone_from keeps their heap buffers).
-    det: State,           // walk determinization (mutated to the leaf)
-    leaf_det: State,      // leaf/boundary/root state preserved across the GPU roundtrip
-    path: Vec<usize>,     // walk path of the in-flight leaf (backprop target)
-    staged_enc: Vec<f32>, // encoding of the leaf currently awaiting a forward
+/// Ready queue + spawn/finish bookkeeping, all under one lock so the spawn
+/// budget (`started`) and the in-flight count never race.
+struct Ready {
+    queue: VecDeque<Box<InFlight>>,
+    started: usize,   // games spawned so far (<= matches)
+    in_flight: usize, // games alive (spawned, not yet finalized)
 }
 
-fn spawn_fresh(shared: &Shared) -> InFlight {
-    let id = shared.id_counter.fetch_add(1, AtomicOrdering::Relaxed);
-    let seed = mix64(shared.config.seed ^ mix64(id.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
-    let mut rng = StdRng::seed_from_u64(seed);
+/// Bounded pre-inference queue feeding the single inference thread. Workers push
+/// staged games (blocking at capacity = backpressure); the inference thread pops
+/// up to `batch`. The gather predicate also runs a *partial* batch once every
+/// remaining in-flight game is already queued here (ramp-down / tail), so the
+/// pipeline drains without a fixed-batch deadlock.
+struct PreInfer {
+    inner: Mutex<VecDeque<Box<InFlight>>>,
+    not_empty: Condvar,
+    not_full: Condvar,
+    cap: usize,
+    closed: AtomicBool,
+}
+
+impl PreInfer {
+    fn new(cap: usize) -> PreInfer {
+        PreInfer {
+            inner: Mutex::new(VecDeque::new()),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
+            cap,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Worker push; blocks while at capacity. Err once closed (shutdown).
+    fn push(&self, g: Box<InFlight>) -> Result<(), ()> {
+        let mut q = self.inner.lock().unwrap();
+        while q.len() >= self.cap && !self.closed.load(Ordering::Relaxed) {
+            q = self.not_full.wait(q).unwrap();
+        }
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(());
+        }
+        q.push_back(g);
+        drop(q);
+        self.not_empty.notify_one();
+        Ok(())
+    }
+
+    /// Inference gather: block until either a full `batch` is available, or every
+    /// remaining in-flight game is already queued here (then take the partial), or
+    /// closed. Returns None only when closed with nothing left. `in_flight` is a
+    /// snapshot read each wakeup; `wake_gather` is pulsed when it shrinks so the
+    /// partial-batch predicate is re-evaluated even when no push arrives.
+    fn gather(&self, batch: usize, in_flight: &AtomicU64) -> Option<Vec<Box<InFlight>>> {
+        let mut q = self.inner.lock().unwrap();
+        loop {
+            if self.closed.load(Ordering::Relaxed) {
+                return None;
+            }
+            let live = in_flight.load(Ordering::Acquire) as usize;
+            // Run when we have a full batch, or when nothing more can arrive
+            // (all live games are sitting right here). `live <= q.len()` covers
+            // the moment the last stragglers land.
+            if q.len() >= batch || (q.len() >= live && q.len() > 0) {
+                let take = batch.min(q.len());
+                let games: Vec<Box<InFlight>> = q.drain(..take).collect();
+                drop(q);
+                self.not_full.notify_all();
+                return Some(games);
+            }
+            q = self.not_empty.wait(q).unwrap();
+        }
+    }
+
+    fn close(&self) {
+        // Set `closed` under `inner` (the gather/push predicate mutex) so a waiter
+        // that just read closed=false can't park and miss this shutdown wakeup.
+        {
+            let _q = self.inner.lock().unwrap();
+            self.closed.store(true, Ordering::Relaxed);
+        }
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
+    }
+}
+
+struct Shared {
+    ready: Mutex<Ready>,
+    ready_cv: Condvar, // worker wakeups: a requeue arrived, or all work is done
+    preinfer: PreInfer,
+    in_flight: AtomicU64, // mirror of Ready.in_flight for PreInfer::gather
+    stop: AtomicBool,
+    matches: usize,
+    concurrency: usize,
+    temperature: f64,
+    seed: u64,
+}
+
+fn spawn_fresh(base_seed: u64, id: u64) -> Box<InFlight> {
+    let mut rng = StdRng::seed_from_u64(mix64(base_seed ^ mix64(id.wrapping_mul(0x9E37_79B9_7F4A_7C15))));
     let state = State::new_match(&mut rng);
-    let searcher = state.awaiting.expect("fresh match awaits a leader");
-    InFlight {
-        det: state.clone(),
-        leaf_det: state.clone(),
+    Box::new(InFlight {
         state,
-        searcher,
-        arena: new_root(searcher),
-        rng,
         decisions: Vec::new(),
-        phase: GamePhase::NeedRootExpand,
-        pending: None,
-        leaf_ctx: None,
-        path: Vec::new(),
+        rng,
         staged_enc: Vec::new(),
-    }
+        staged_mover: Player::Human,
+        pending: None,
+    })
 }
 
-fn finalize_rows(g: &mut InFlight) -> Vec<Row> {
-    let winner = g.state.match_winner().expect("finalize before MatchOver");
-    g.decisions
-        .drain(..)
-        .map(|d| {
-            let z = if d.seat == winner { 1.0f32 } else { -1.0f32 };
-            (d.state_enc, d.pi, z)
-        })
-        .collect()
+enum Advance {
+    Eval,
+    Done(Player), // match winner
 }
 
-/// Apply the forward result for the staged leaf: expand it and backprop (or, for
-/// the root, expand + add noise). Mirrors the eval branch of `mcts::run_search`.
-fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
-    let ctx = g.leaf_ctx.take().expect("pending result without leaf_ctx");
-    let logits = &res.logits[res.row * POLICY_SIZE..(res.row + 1) * POLICY_SIZE];
-    let value = res.value as f64;
-    match ctx.kind {
-        LeafKind::RootExpand => {
-            expand_node(&mut g.arena, 0, &g.leaf_det, logits, g.searcher);
-            if config.add_root_noise {
-                add_dirichlet_noise(&mut g.arena, 0, &mut g.rng);
-            }
-            g.phase = GamePhase::Simulating(0);
-        }
-        LeafKind::SimLeaf => {
-            expand_node(&mut g.arena, ctx.leaf_idx, &g.leaf_det, logits, g.searcher);
-            let v_ref = if ctx.mover == g.searcher { value } else { -value };
-            backprop(&mut g.arena, &g.path, v_ref);
-            if let GamePhase::Simulating(s) = g.phase {
-                g.phase = GamePhase::Simulating(s + 1);
-            }
-        }
-        LeafKind::Boundary => {
-            let v_ref = if ctx.mover == g.searcher { value } else { -value };
-            backprop(&mut g.arena, &g.path, v_ref);
-            if let GamePhase::Simulating(s) = g.phase {
-                g.phase = GamePhase::Simulating(s + 1);
-            }
-        }
-    }
-}
-
-/// Pick the real move from the finished search, record the decision, play it, and
-/// advance the true state to the next decision. Returns true if the match ended.
-fn step_move(g: &mut InFlight) -> bool {
-    let temp = temperature(g.state.round_num, g.state.trick_num);
-    // Policy target: RAW visit proportions (AlphaZero). The annealed temperature
-    // applies only to move *selection* below — sharpening the stored target too
-    // (visits^(1/temp)) discards the search's soft information and feeds an
-    // overconfidence loop through the PUCT prior term.
-    let pi = visits_to_pi(&g.arena, 0, 1.0);
-    let state_enc = encode(&g.state, g.searcher);
-    g.decisions.push(Decision { state_enc, pi, seat: g.searcher });
-
-    let mv = sample_move(&g.arena, 0, temp, &mut g.rng);
-    let card = real_card_from_canon_index(mv, g.state.trump.suit);
-    g.state.apply(card);
+/// Drive `g` from its current phase to the next Playing decision (staging its
+/// encoding) or to MatchOver. Mirrors the slot-advance logic in `selfplay::run`.
+fn advance(g: &mut InFlight) -> Advance {
     loop {
         match g.state.phase {
-            Phase::Playing => break,
+            Phase::Playing => {
+                let mover = g.state.awaiting.unwrap();
+                g.staged_enc = encode(&g.state, mover);
+                g.staged_mover = mover;
+                return Advance::Eval;
+            }
             Phase::TrickComplete => g.state.advance_after_trick(),
             Phase::RoundOver => {
                 let mut rng = std::mem::replace(&mut g.rng, StdRng::seed_from_u64(0));
                 g.state.end_round(&mut rng);
                 g.rng = rng;
             }
-            Phase::MatchOver => break,
+            Phase::MatchOver => return Advance::Done(g.state.match_winner().unwrap()),
         }
     }
-    if g.state.phase == Phase::MatchOver {
-        return true;
-    }
-    g.searcher = g.state.awaiting.expect("next decision awaits a mover");
-    g.arena.clear(); // fresh root, arena Vec capacity kept
-    g.arena.push(Node::new(0.0, g.searcher));
-    g.phase = GamePhase::NeedRootExpand;
-    false
 }
 
-enum Advance {
-    Eval,
-    Done(Vec<Row>),
+/// Apply the forward result for the staged decision: sample a move, record the
+/// decision, and play it. Leaves `g` at the post-move phase for `advance`.
+fn apply_pending(g: &mut InFlight, temperature: f64) {
+    let (logits, row) = g.pending.take().expect("apply_pending without pending result");
+    let mover = g.staged_mover;
+    let mask = legal_mask(&g.state, mover);
+    let logit_row = &logits[row * NUM_CARDS..(row + 1) * NUM_CARDS];
+    let action = sample_action(logit_row, &mask, temperature, &mut g.rng);
+    let state_vec = std::mem::take(&mut g.staged_enc);
+    g.decisions.push(Decision { state: state_vec, mask, action: action as u32, seat: mover });
+    let card = real_card_from_canon_index(action, g.state.trump.suit);
+    g.state.apply(card);
 }
 
-/// Drive the game until it stages one leaf for evaluation or finishes.
-fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
+/// Pop a game to work on: an existing requeued game, a freshly spawned one if
+/// there's spawn budget and concurrency headroom, or None when the cohort is
+/// complete (all matches finished). Blocks while games are out at inference.
+fn acquire(shared: &Shared) -> Option<Box<InFlight>> {
+    let mut r = shared.ready.lock().unwrap();
     loop {
-        match g.phase {
-            GamePhase::NeedRootExpand => {
-                encode_into(&g.state, g.searcher, &mut g.staged_enc);
-                g.leaf_det.clone_from(&g.state);
-                g.leaf_ctx = Some(LeafCtx {
-                    kind: LeafKind::RootExpand,
-                    leaf_idx: 0,
-                    mover: g.searcher,
-                });
-                return Advance::Eval;
-            }
-            GamePhase::Simulating(s) => {
-                if s >= config.sims {
-                    if step_move(g) {
-                        return Advance::Done(finalize_rows(g));
-                    }
-                    continue;
-                }
-                determinize_into(&g.state, g.searcher, &mut g.rng, &mut g.det);
-                match walk_to_leaf(&mut g.arena, 0, &mut g.det, g.searcher, &mut g.path, &mut g.leaf_det) {
-                    WalkResult::Terminal { v_ref } => {
-                        backprop(&mut g.arena, &g.path, v_ref);
-                        g.phase = GamePhase::Simulating(s + 1);
-                    }
-                    WalkResult::BoundaryEval { mover } => {
-                        // walk_to_leaf left the pre-move boundary state in leaf_det
-                        encode_into(&g.leaf_det, mover, &mut g.staged_enc);
-                        g.leaf_ctx = Some(LeafCtx {
-                            kind: LeafKind::Boundary,
-                            leaf_idx: 0, // unused (no expansion)
-                            mover,
-                        });
-                        return Advance::Eval;
-                    }
-                    WalkResult::Eval { mover } => {
-                        let leaf_idx = *g.path.last().unwrap();
-                        // Preserve the leaf's determinization across the GPU
-                        // roundtrip (expand_node needs it); g.det is overwritten
-                        // by the next simulation's determinize_into.
-                        std::mem::swap(&mut g.det, &mut g.leaf_det);
-                        encode_into(&g.leaf_det, mover, &mut g.staged_enc);
-                        g.leaf_ctx = Some(LeafCtx {
-                            kind: LeafKind::SimLeaf,
-                            leaf_idx,
-                            mover,
-                        });
-                        return Advance::Eval;
-                    }
-                }
-            }
+        if shared.stop.load(Ordering::Relaxed) {
+            return None;
         }
+        if let Some(g) = r.queue.pop_front() {
+            return Some(g);
+        }
+        if r.started < shared.matches && r.in_flight < shared.concurrency {
+            let id = r.started as u64;
+            r.started += 1;
+            r.in_flight += 1;
+            shared.in_flight.store(r.in_flight as u64, Ordering::Release);
+            return Some(spawn_fresh(shared.seed, id));
+        }
+        if r.started >= shared.matches && r.in_flight == 0 {
+            return None; // cohort complete
+        }
+        r = shared.ready_cv.wait(r).unwrap();
     }
 }
 
-// --- ply-bucketed priority queue (most real moves made first) -----------------
-//
-// The priority key is the number of real moves already made — a small bounded
-// integer — so one Vec per ply replaces a comparison heap: push is O(1), and a
-// batch gather drains whole buckets top-down (pointer memmoves, not per-item
-// sift-downs), keeping every lock hold tiny.
-
-/// A match is at most 7 rounds (every round awards >= 6 total points and 21
-/// ends it) x 26 plies = 182 plies, and a game is re-queued having made at most
-/// 181 moves — so ply keys span 0..=181. The min() clamp is belt-and-braces.
-const N_BUCKETS: usize = 182;
-
-fn priority_key(g: &InFlight) -> usize {
-    g.decisions.len().min(N_BUCKETS - 1)
+/// Flush a finished game's decisions into the worker-local cohort buffer.
+fn finalize_local(out: &mut WorkerOut, g: &InFlight, winner: Player) {
+    for d in &g.decisions {
+        let z = if d.seat == winner { 1.0f32 } else { -1.0f32 };
+        out.rows.extend_from_slice(&d.state);
+        out.rows.extend_from_slice(&d.mask);
+        out.rows.push(d.action as f32);
+        out.rows.push(z);
+    }
+    out.total_decisions += g.decisions.len() as u64;
+    out.wins[winner.idx()] += 1;
+    out.finished += 1;
 }
 
-struct Buckets {
-    by_ply: Vec<Vec<Box<InFlight>>>,
-    len: usize,
-    hi: usize, // highest possibly-non-empty bucket (raised on push, settled by drains)
-}
-impl Buckets {
-    fn new() -> Buckets {
-        Buckets { by_ply: (0..N_BUCKETS).map(|_| Vec::new()).collect(), len: 0, hi: 0 }
+/// Shared in-flight bookkeeping for one completed game (no row copy here).
+fn complete_one(shared: &Shared) {
+    let mut r = shared.ready.lock().unwrap();
+    r.in_flight -= 1;
+    let live = r.in_flight;
+    let done = r.started >= shared.matches && live == 0;
+    drop(r);
+    // in_flight shrank, so the gather's partial-batch predicate (`q.len() >= in_flight`)
+    // may now fire. Publish the shrunk count under the *preinfer* lock so the store and
+    // the notify are serialized against gather's predicate check on the same mutex —
+    // otherwise gather can read the old count, decide to wait, and miss this notify
+    // (lost wakeup -> the cohort's tail hangs forever).
+    {
+        let _q = shared.preinfer.inner.lock().unwrap();
+        shared.in_flight.store(live as u64, Ordering::Release);
     }
-    fn push(&mut self, g: Box<InFlight>) {
-        let k = priority_key(&g);
-        self.by_ply[k].push(g);
-        self.len += 1;
-        if k > self.hi {
-            self.hi = k;
-        }
-    }
-    /// Move up to `max` games from the highest buckets into `out` (newest first
-    /// within a ply, mirroring the old heap's seq tie-break). Returns the count.
-    fn drain_top(&mut self, max: usize, out: &mut Vec<Box<InFlight>>) -> usize {
-        let want = max.min(self.len);
-        let mut moved = 0;
-        let mut b = self.hi;
-        while moved < want {
-            let take = (want - moved).min(self.by_ply[b].len());
-            if take > 0 {
-                let bucket = &mut self.by_ply[b];
-                let at = bucket.len() - take;
-                out.extend(bucket.drain(at..));
-                self.len -= take;
-                moved += take;
-            }
-            if moved == want || b == 0 {
-                break;
-            }
-            b -= 1;
-        }
-        self.hi = b;
-        moved
+    shared.preinfer.not_empty.notify_all();
+    // If the cohort just completed, wake everyone to shut down cleanly.
+    if done {
+        shared.ready_cv.notify_all();
+        shared.preinfer.close();
     }
 }
 
-struct PreInferState {
-    buckets: Buckets,
-    // Waiter bookkeeping so notifies are skipped (no futex syscall) when no one
-    // is parked — the common case for both condvars.
-    waiting_pushers: usize,
-    gather_waiting: bool,
-}
-
-/// Bounded, blocking ply-priority pre-inference queue.
-struct PreInferQueue {
-    inner: Mutex<PreInferState>,
-    batch_ready: Condvar, // inference thread waits here for len >= batch
-    not_full: Condvar,    // workers wait here for len < cap
-    cap: usize,
-    batch: usize,
-    closed: AtomicBool,
-}
-impl PreInferQueue {
-    fn new(cap: usize, batch: usize) -> PreInferQueue {
-        PreInferQueue {
-            inner: Mutex::new(PreInferState {
-                buckets: Buckets::new(),
-                waiting_pushers: 0,
-                gather_waiting: false,
-            }),
-            batch_ready: Condvar::new(),
-            not_full: Condvar::new(),
-            cap,
-            batch,
-            closed: AtomicBool::new(false),
+fn worker_loop(shared: Arc<Shared>) -> WorkerOut {
+    let mut out = WorkerOut::default();
+    while let Some(mut g) = acquire(&shared) {
+        if g.pending.is_some() {
+            apply_pending(&mut g, shared.temperature);
         }
-    }
-    fn push(&self, g: Box<InFlight>) -> Result<(), ()> {
-        let mut q = self.inner.lock().unwrap();
-        while q.buckets.len >= self.cap && !self.closed.load(AtomicOrdering::Relaxed) {
-            q.waiting_pushers += 1;
-            q = self.not_full.wait(q).unwrap();
-            q.waiting_pushers -= 1;
-        }
-        if self.closed.load(AtomicOrdering::Relaxed) {
-            return Err(());
-        }
-        q.buckets.push(g);
-        // Edge-triggered wake: gather re-checks `len` itself while it stays
-        // >= batch, so signalling every push would be a wasted syscall per leaf.
-        let wake = q.gather_waiting && q.buckets.len >= self.batch;
-        drop(q);
-        if wake {
-            self.batch_ready.notify_one();
-        }
-        Ok(())
-    }
-    fn gather(&self) -> Option<Vec<Box<InFlight>>> {
-        let batch = self.batch;
-        let mut q = self.inner.lock().unwrap();
-        while q.buckets.len < batch && !self.closed.load(AtomicOrdering::Relaxed) {
-            q.gather_waiting = true;
-            q = self.batch_ready.wait(q).unwrap();
-            q.gather_waiting = false;
-        }
-        if q.buckets.len < batch {
-            return None; // closed with a partial batch -> drop and shut down
-        }
-        let mut games: Vec<Box<InFlight>> = Vec::with_capacity(batch);
-        q.buckets.drain_top(batch, &mut games);
-        let wake = q.waiting_pushers > 0;
-        drop(q);
-        if wake {
-            // At most n_threads waiters, each doing an O(1) push on wake; the
-            // old per-push notify_one + post-gather broadcast was a herd.
-            self.not_full.notify_all();
-        }
-        Some(games)
-    }
-    fn close(&self) {
-        self.closed.store(true, AtomicOrdering::Relaxed);
-        self.batch_ready.notify_all();
-        self.not_full.notify_all();
-    }
-}
-
-/// Games a worker claims from the return queue per lock hold. Large enough to
-/// make the lock acquisition rate trivial (~2 per worker per batch cycle),
-/// small enough that the ply fast-lane keeps cross-cycle granularity: a worker
-/// re-checks the top buckets every CLAIM games, so nearly-finished games keep
-/// jumping ahead and completions stay smooth. (v1 of this rework used plain
-/// per-worker inboxes — no cross-game priority — and the whole in-flight
-/// population marched in lockstep, finishing in synchronized waves that
-/// transiently drained the pipe and cost ~6% games/sec.)
-const CLAIM: usize = 32;
-
-struct Shared {
-    /// Scattered games (result attached) awaiting a worker, ply-bucketed:
-    /// scatter bulk-pushes a batch in one short hold (O(1) per game), workers
-    /// claim CLAIM-sized chunks from the top buckets.
-    returns: Mutex<Buckets>,
-    preinfer: PreInferQueue,
-    stop: AtomicBool,
-    id_counter: AtomicU64,
-    config: Config,
-    games_done: AtomicU64,
-    rows_done: AtomicU64,
-}
-
-fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
-    let mut local: Vec<Box<InFlight>> = Vec::new(); // claimed chunk, highest ply last
-    loop {
-        if shared.stop.load(AtomicOrdering::Relaxed) {
-            return;
-        }
-        let mut g: Box<InFlight> = match local.pop() {
-            Some(g) => g,
-            None => {
-                {
-                    let mut q = shared.returns.lock().unwrap();
-                    q.drain_top(CLAIM, &mut local);
-                }
-                local.reverse(); // drain_top fills highest-first; pop() takes the back
-                match local.pop() {
-                    Some(g) => g,
-                    // Nothing scattered anywhere => spawn rather than wait
-                    // (dynamic game count; the preinfer cap is the backpressure).
-                    None => Box::new(spawn_fresh(&shared)),
-                }
-            }
-        };
-        if let Some(res) = g.pending.take() {
-            apply_result(&mut g, res, &shared.config);
-        }
-        match advance_until_eval_or_done(&mut g, &shared.config) {
+        match advance(&mut g) {
             Advance::Eval => {
                 if shared.preinfer.push(g).is_err() {
-                    return; // closed (shutdown)
+                    break; // closed (shutdown)
                 }
             }
-            Advance::Done(rows) => {
-                shared.games_done.fetch_add(1, AtomicOrdering::Relaxed);
-                shared.rows_done.fetch_add(rows.len() as u64, AtomicOrdering::Relaxed);
-                sink(rows);
+            Advance::Done(winner) => {
+                finalize_local(&mut out, &g, winner);
+                complete_one(&shared);
             }
         }
     }
+    out
 }
 
-fn requeue_scattered(
-    shared: &Shared,
-    logits: Arc<Vec<f32>>,
-    values: &[f32],
-    mut games: Vec<Box<InFlight>>,
-) {
-    // Attach results outside the lock; the hold below is pure bucket pushes.
-    for (r, g) in games.iter_mut().enumerate() {
-        g.pending = Some(EvalResult {
-            logits: Arc::clone(&logits),
-            row: r,
-            value: values[r],
-        });
-    }
-    let mut q = shared.returns.lock().unwrap();
-    for g in games {
-        q.push(g);
-    }
-}
-
-// --- inference + scatter -----------------------------------------------------
+/// One in-flight forward handed from the inference thread to the scatter thread.
+/// `logits` is still on the GPU; the scatter thread reads it back (D2H) after the
+/// `event` fires, so the readback overlaps the inference thread's next forward.
 struct WorkItem {
-    logits: Tensor, // GPU [m, 33]
-    values: Tensor, // GPU [m]
-    event: CudaEvent,
     games: Vec<Box<InFlight>>,
+    logits: Tensor, // GPU [m, NUM_CARDS]
+    event: CudaEvent,
 }
 
-/// The forward backend: the eager tch net (CPU / no `--model`), or the fused
-/// AOTInductor `.pt2` (CUDA + `--model`). Both consume bf16 input on CUDA and
-/// return bf16 outputs; the launch path narrows/widens identically for either.
-enum Backend {
-    Tch(Net),
-    Aoti(AotiModel),
-}
-
-/// Push the safetensors sidecar's weights into the loaded AOTI package in place
-/// (no recompile). Constants are keyed by the MANGLED FQN ('.'->'_'); tensors go
-/// to CUDA bf16. Returns false on a transient read error (retried next tick).
-fn aoti_swap(model: &AotiModel, weights_path: &str, dev: Device) -> bool {
-    let entries = match Tensor::read_safetensors(weights_path) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let mut names: Vec<std::ffi::CString> = Vec::with_capacity(entries.len());
-    let mut tensors: Vec<Tensor> = Vec::with_capacity(entries.len());
-    for (name, t) in entries {
-        names.push(std::ffi::CString::new(name.replace('.', "_")).unwrap());
-        tensors.push(t.to_device(dev).to_kind(Kind::BFloat16));
-    }
-    let refs: Vec<&Tensor> = tensors.iter().collect();
-    model.swap_weights(&names, &refs);
-    true
-}
-
-/// Owns the forward backend on the inference thread; reloads weights in place on
-/// mtime change (the trainer republishes the safetensors sidecar atomically).
-struct Infer {
-    backend: Backend,
+/// Inference (GPU producer): gather a batch off the pre-inference queue, copy it
+/// to the device, launch the forward, record a completion event, and hand the
+/// in-flight forward to the scatter thread — then immediately loop to launch the
+/// next batch. The readback (the old blocking `to_device(Cpu)`) now lives on the
+/// scatter thread, so this thread never blocks on the GPU and keeps it fed.
+fn inference_loop(
+    shared: Arc<Shared>,
+    net: &Net,
     dev: Device,
-    kind: Kind, // forward dtype: bf16 on CUDA (tensor cores + half the memory traffic), fp32 on CPU
-    weights_path: String,
-    reload_every: Duration,
-    last_check: Instant,
-    last_mtime: Option<std::time::SystemTime>,
-}
-impl Infer {
-    fn new(config: &Config, dev: Device) -> Infer {
-        // The forward is dominated by matmul; bf16 uses tensor cores + halves the
-        // H2D/activation traffic. CPU bf16 is slow/uneven, so CPU stays fp32.
-        let kind = if matches!(dev, Device::Cuda(_)) { Kind::BFloat16 } else { Kind::Float };
-        let use_aoti = !config.model_path.is_empty() && matches!(dev, Device::Cuda(_));
-        let backend = if use_aoti {
-            // Loaded ONCE; the .pt2 bakes export-time weights, so swap in the current
-            // sidecar before the first forward (and on every publish via maybe_reload).
-            let model = AotiModel::load(&config.model_path);
-            match model.check_batch(config.batch as i64, ENC_LEN as i64) {
-                0 => {}
-                code => {
-                    eprintln!(
-                        "FATAL: {} not compiled for batch={} (aoti_check_batch={code}); \
-                         re-export the .pt2 at this batch (SERVING_BATCH in net.py)",
-                        config.model_path, config.batch
-                    );
-                    std::process::exit(1);
-                }
-            }
-            aoti_swap(&model, &config.weights_path, dev);
-            Backend::Aoti(model)
-        } else {
-            Backend::Tch(Net::load(&config.weights_path, dev, kind))
-        };
-        Infer {
-            backend,
-            dev,
-            kind,
-            last_mtime: std::fs::metadata(&config.weights_path).and_then(|m| m.modified()).ok(),
-            weights_path: config.weights_path.clone(),
-            reload_every: config.reload_every,
-            last_check: Instant::now(),
-        }
-    }
-    fn maybe_reload(&mut self) {
-        if self.last_check.elapsed() < self.reload_every {
-            return;
-        }
-        self.last_check = Instant::now();
-        let m = std::fs::metadata(&self.weights_path).and_then(|md| md.modified()).ok();
-        if m.is_none() || m == self.last_mtime {
-            return;
-        }
-        match &self.backend {
-            Backend::Tch(net) => net.reload(&self.weights_path), // copies fresh weights in place
-            Backend::Aoti(model) => {
-                if !aoti_swap(model, &self.weights_path, self.dev) {
-                    return; // transient read; keep last_mtime so we retry next tick
-                }
-            }
-        }
-        self.last_mtime = m;
-    }
-    /// Launch one async forward over `m` staged encodings; returns the GPU output
-    /// tensors + a completion event (the scatter thread reads them back).
-    fn launch(&self, enc: &[f32], m: usize) -> (Tensor, Tensor, CudaEvent) {
-        // Narrow to the forward dtype on the CPU side so the H2D copy moves half
-        // the bytes (bf16), then ship to the device.
-        let x = Tensor::from_slice(enc)
-            .reshape([m as i64, ENC_LEN as i64])
-            .to_kind(self.kind)
-            .to_device(self.dev);
-        let (logits, values) = match &self.backend {
-            Backend::Tch(net) => net.forward(&x),
-            Backend::Aoti(model) => {
-                // Fresh output tensors per launch (not static buffers), so the scatter
-                // thread can read these while the next forward runs — same overlap as
-                // the eager path. AOTI is static-batch, so m must equal config.batch
-                // (guaranteed: gather() only returns full batches).
-                let out_l = Tensor::zeros([m as i64, POLICY_SIZE as i64], (self.kind, self.dev));
-                let out_v = Tensor::zeros([m as i64], (self.kind, self.dev));
-                model.run(&x, &out_l, &out_v);
-                (out_l, out_v)
-            }
-        };
-        let logits = logits.to_kind(Kind::Float);
-        let values = values.to_kind(Kind::Float);
-        let event = CudaEvent::new();
-        event.record();
-        (logits, values, event)
-    }
-}
-
-fn inference_thread(shared: Arc<Shared>, work_tx: SyncSender<WorkItem>) {
-    let dev = pick_device(shared.config.cpu);
-    let mut infer = Infer::new(&shared.config, dev);
-    let batch = shared.config.batch.max(1);
-    let mut enc: Vec<f32> = Vec::with_capacity(batch * ENC_LEN);
+    batch: usize,
+    work_tx: SyncSender<WorkItem>,
+) {
+    let mut enc_flat: Vec<f32> = Vec::with_capacity(batch * INPUT_SIZE);
     loop {
-        if shared.stop.load(AtomicOrdering::Relaxed) {
-            return;
-        }
-        let games = match shared.preinfer.gather() {
+        let games = match shared.preinfer.gather(batch, &shared.in_flight) {
             Some(g) => g,
-            None => return, // closed: dropping work_tx drains the scatter thread
+            None => return, // closed (shutdown): dropping work_tx drains the scatter thread
         };
-        enc.clear();
-        for g in &games {
-            enc.extend_from_slice(&g.staged_enc);
-        }
-        infer.maybe_reload();
         let m = games.len();
-        let (logits, values, event) = infer.launch(&enc, m);
-        if work_tx.send(WorkItem { logits, values, event, games }).is_err() {
+        enc_flat.clear();
+        for g in &games {
+            enc_flat.extend_from_slice(&g.staged_enc);
+        }
+        let x = Tensor::from_slice(&enc_flat)
+            .reshape([m as i64, INPUT_SIZE as i64])
+            .to_device(dev);
+        let (logits, _v) = net.forward(&x); // async on the stream
+        let logits = logits.to_kind(Kind::Float); // stays on GPU; scatter reads it back
+        let event = CudaEvent::new();
+        event.record(); // fires when this forward completes
+        if work_tx.send(WorkItem { games, logits, event }).is_err() {
             return; // scatter gone
         }
     }
 }
 
-fn scatter_thread(shared: Arc<Shared>, work_rx: Receiver<WorkItem>) {
+/// Scatter (GPU consumer): wait each forward's event, read its logits back to the
+/// host, attach each game's (shared logits, row), and requeue it for a worker.
+/// Overlaps the inference thread's next forward. Exits when the inference thread
+/// drops `work_tx` (shutdown) and the channel drains.
+fn scatter_loop(shared: Arc<Shared>, work_rx: Receiver<WorkItem>) {
     while let Ok(item) = work_rx.recv() {
-        item.event.sync();
+        item.event.sync(); // wait the forward
         let m = item.games.len();
         let logits = item.logits.to_device(Device::Cpu).contiguous();
-        let values = item.values.to_device(Device::Cpu).contiguous();
-        let mut lh = vec![0f32; m * POLICY_SIZE];
-        logits.copy_data(&mut lh, m * POLICY_SIZE);
-        let mut vh = vec![0f32; m];
-        values.copy_data(&mut vh, m);
-        requeue_scattered(&shared, Arc::new(lh), &vh, item.games);
+        // One host buffer per forward, shared by Arc; workers slice their own row.
+        let mut host = vec![0f32; m * NUM_CARDS];
+        logits.copy_data(&mut host, m * NUM_CARDS);
+        let host = Arc::new(host);
+
+        // Attach each game's (shared logits, row) and requeue for a worker.
+        let mut r = shared.ready.lock().unwrap();
+        for (k, mut g) in item.games.into_iter().enumerate() {
+            g.pending = Some((Arc::clone(&host), k));
+            r.queue.push_back(g);
+        }
+        drop(r);
+        shared.ready_cv.notify_all();
     }
 }
 
+/// Pick the self-play device (CUDA if available, unless `--cpu`).
 pub fn pick_device(cpu: bool) -> Device {
     if cpu {
         Device::Cpu
@@ -695,154 +409,159 @@ pub fn pick_device(cpu: bool) -> Device {
     }
 }
 
-fn make_shared(config: Config) -> Arc<Shared> {
-    let batch = config.batch.max(1);
-    let cap = (2 * config.n_slots.max(1) * batch).max(batch);
-    Arc::new(Shared {
-        returns: Mutex::new(Buckets::new()),
-        preinfer: PreInferQueue::new(cap, batch),
-        stop: AtomicBool::new(false),
-        id_counter: AtomicU64::new(0),
-        config,
-        games_done: AtomicU64::new(0),
-        rows_done: AtomicU64::new(0),
-    })
+pub fn run(cfg: Config) {
+    let dev = pick_device(cfg.cpu);
+    let net = Net::load(&cfg.weights, dev, Kind::Float);
+    run_with_net(&cfg, &net, dev);
 }
 
-struct Pipeline {
-    workers: Vec<thread::JoinHandle<()>>,
-    infer: thread::JoinHandle<()>,
-    scatter: thread::JoinHandle<()>,
-}
+/// Persistent worker: initialize CUDA/libtorch once, then run one cohort per
+/// newline-delimited JSON command on stdin (`{weights,out,matches,batch,
+/// concurrency,threads,slots,temperature,seed}`, plus optional `quit`). Reloads
+/// weights per command (a few ms for this net) and acks each cohort with a
+/// `{"done":true}` line — the cohort itself is handed off via the `out` file.
+pub fn serve(dev: Device) {
+    use std::io::{BufRead, Write};
 
-fn spawn_pipeline(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) -> Pipeline {
-    let n_threads = shared.config.n_threads.max(1);
-    let n_slots = shared.config.n_slots.max(1);
-    let mut workers = Vec::with_capacity(n_threads);
-    for _ in 0..n_threads {
-        let sh = shared.clone();
-        let sk = sink.clone();
-        workers.push(thread::spawn(move || worker_loop(sh, sk)));
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    println!("{}", serde_json::json!({"ready": true}));
+    stdout.flush().expect("flush ready");
+
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break, // stdin closed -> shut down
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cmd: ServeCmd = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("bad serve command {line:?}: {e}"));
+        if cmd.quit {
+            break;
+        }
+        let cfg = cmd.into_config();
+        // Reload weights each cohort: the orchestrator rewrites the same path
+        // (serving_weights.safetensors) every iteration, so a path cache would miss.
+        let net = Net::load(&cfg.weights, dev, Kind::Float);
+        run_with_net(&cfg, &net, dev);
+        println!("{}", serde_json::json!({"done": true}));
+        stdout.flush().expect("flush done");
     }
-    let (work_tx, work_rx) = sync_channel::<WorkItem>(n_slots);
-    let infer = {
-        let sh = shared.clone();
-        thread::spawn(move || inference_thread(sh, work_tx))
-    };
+}
+
+/// One self-play command from the orchestrator (mirrors `Config`'s knobs).
+#[derive(serde::Deserialize)]
+struct ServeCmd {
+    weights: String,
+    out: String,
+    matches: usize,
+    batch: usize,
+    concurrency: usize,
+    threads: usize,
+    slots: usize,
+    temperature: f64,
+    seed: u64,
+    #[serde(default)]
+    cpu: bool,
+    #[serde(default)]
+    quit: bool,
+}
+
+impl ServeCmd {
+    fn into_config(self) -> Config {
+        Config {
+            weights: self.weights,
+            out: self.out,
+            matches: self.matches,
+            batch: self.batch,
+            concurrency: self.concurrency,
+            n_threads: self.threads,
+            slots: self.slots,
+            temperature: self.temperature,
+            seed: self.seed,
+            cpu: self.cpu,
+        }
+    }
+}
+
+/// Generate one cohort with an already-loaded net (shared by `run` and `serve`).
+fn run_with_net(cfg: &Config, net: &Net, dev: Device) {
+    let batch = cfg.batch.max(1).min(cfg.matches.max(1));
+    let concurrency = cfg.concurrency.max(batch).min(cfg.matches.max(1));
+    let n_threads = cfg.n_threads.max(1);
+    let slots = cfg.slots.max(1);
+    // Pre-inference cap >= concurrency so every in-flight game can be queued at
+    // once (the bulk-synchronous limit); 2x leaves slack for pipelined refills.
+    let cap = (2 * concurrency).max(batch);
+
+    let shared = Arc::new(Shared {
+        ready: Mutex::new(Ready {
+            queue: VecDeque::new(),
+            started: 0,
+            in_flight: 0,
+        }),
+        ready_cv: Condvar::new(),
+        preinfer: PreInfer::new(cap),
+        in_flight: AtomicU64::new(0),
+        stop: AtomicBool::new(false),
+        matches: cfg.matches,
+        concurrency,
+        temperature: cfg.temperature,
+        seed: cfg.seed,
+    });
+
+    let start = Instant::now();
+    let workers: Vec<_> = (0..n_threads)
+        .map(|_| {
+            let sh = shared.clone();
+            thread::spawn(move || worker_loop(sh))
+        })
+        .collect();
+
+    // The scatter thread reads each forward's logits back to the host and requeues
+    // the games; bound the channel at `slots` so the inference thread can run at
+    // most `slots` forwards ahead of the readback (backpressure).
+    let (work_tx, work_rx) = sync_channel::<WorkItem>(slots);
     let scatter = {
         let sh = shared.clone();
-        thread::spawn(move || scatter_thread(sh, work_rx))
+        thread::spawn(move || scatter_loop(sh, work_rx))
     };
-    Pipeline { workers, infer, scatter }
-}
 
-fn shutdown(shared: &Shared, p: Pipeline) {
-    shared.stop.store(true, AtomicOrdering::Relaxed);
-    shared.preinfer.close();
-    for h in p.workers {
-        let _ = h.join();
+    // Inference runs on this thread (owns the net / GPU). On shutdown it returns
+    // and drops `work_tx`, which drains and ends the scatter thread.
+    inference_loop(shared.clone(), net, dev, batch, work_tx);
+    scatter.join().expect("scatter thread panicked");
+
+    // Merge the per-worker cohort buffers (concatenated; row order is arbitrary,
+    // which is fine — the trainer shuffles).
+    let mut rows: Vec<f32> = Vec::new();
+    let (mut finished, mut total_decisions, mut wins) = (0usize, 0u64, [0u64; 2]);
+    for w in workers {
+        let o = w.join().expect("worker panicked");
+        rows.extend_from_slice(&o.rows);
+        finished += o.finished;
+        total_decisions += o.total_decisions;
+        wins[0] += o.wins[0];
+        wins[1] += o.wins[1];
     }
-    let _ = p.infer.join();
-    let _ = p.scatter.join();
-}
 
-// --- frame streaming (serve mode) --------------------------------------------
-fn write_f32s<W: Write>(w: &mut W, s: &[f32]) -> io::Result<()> {
-    let bytes = unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) };
-    w.write_all(bytes)
-}
-
-/// One finished game = one frame: u32 n_rows, then n_rows x (state[230] f32,
-/// pi[33] f32, z f32), little-endian. Flushed per game.
-fn write_frame(out: &Mutex<BufWriter<io::Stdout>>, rows: &[Row]) {
-    let mut w = out.lock().unwrap();
-    let _ = w.write_all(&(rows.len() as u32).to_le_bytes());
-    for (state, pi, z) in rows {
-        let _ = write_f32s(&mut *w, state);
-        let _ = write_f32s(&mut *w, pi);
-        let _ = w.write_all(&z.to_le_bytes());
-    }
-    let _ = w.flush();
-}
-
-/// Serve mode: run forever, streaming finished games as framed bytes on stdout.
-/// Stops when the parent closes our stdin (EOF = orchestrator died).
-pub fn run_serve(config: Config) {
-    let shared = make_shared(config);
-    let stdout = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
-    let so = stdout.clone();
-    let sink: Arc<dyn Fn(Vec<Row>) + Send + Sync> = Arc::new(move |rows: Vec<Row>| write_frame(&so, &rows));
-    let pipeline = spawn_pipeline(shared.clone(), sink);
-
-    let mut buf = [0u8; 256];
-    loop {
-        match io::stdin().read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-    }
-    shutdown(&shared, pipeline);
-    let _ = stdout.lock().unwrap().flush();
-}
-
-/// Bench mode: run for `run`, printing games/sec + rows/sec every `interval`.
-///
-/// Self-play starts as a synchronized cohort (all games begin near t=0 and finish
-/// in waves), so per-interval rates oscillate wildly for the first minute. We
-/// discard the first `warmup` and report a single cumulative average over the
-/// remaining measure window — that's the number to compare across batch sizes.
-pub fn run_bench(config: Config, run: Duration, interval: Duration, warmup: Duration) {
-    let sims = config.sims;
-    let (nt, ns, nb) = (config.n_threads, config.n_slots, config.batch);
-    let shared = make_shared(config);
-    let sink: Arc<dyn Fn(Vec<Row>) + Send + Sync> = Arc::new(|_rows: Vec<Row>| {});
-    let pipeline = spawn_pipeline(shared.clone(), sink);
-
-    println!("selfplay_rs bench: batch={nb} threads={nt} slots={ns} sims={sims} warmup={:.0}s", warmup.as_secs_f64());
-    let start = Instant::now();
-    let mut win_start = start;
-    let (mut last_g, mut last_r) = (0u64, 0u64);
-    // Counters/clock at the end of warmup, for the cumulative steady-state average.
-    let mut measure_start: Option<Instant> = None;
-    let (mut base_g, mut base_r) = (0u64, 0u64);
-    while start.elapsed() < run {
-        thread::sleep(Duration::from_millis(200));
-        if measure_start.is_none() && start.elapsed() >= warmup {
-            measure_start = Some(Instant::now());
-            base_g = shared.games_done.load(AtomicOrdering::Relaxed);
-            base_r = shared.rows_done.load(AtomicOrdering::Relaxed);
-        }
-        if win_start.elapsed() >= interval {
-            let dt = win_start.elapsed().as_secs_f64();
-            let g = shared.games_done.load(AtomicOrdering::Relaxed);
-            let r = shared.rows_done.load(AtomicOrdering::Relaxed);
-            println!(
-                "[+{:5.0}s] {:7.3} games/sec  ({:5.1} rows/game, {:6.0} rows/sec)",
-                start.elapsed().as_secs_f64(),
-                (g - last_g) as f64 / dt,
-                (r - last_r) as f64 / (g - last_g).max(1) as f64,
-                (r - last_r) as f64 / dt,
-            );
-            last_g = g;
-            last_r = r;
-            win_start = Instant::now();
-        }
-    }
-    let g = shared.games_done.load(AtomicOrdering::Relaxed);
-    let r = shared.rows_done.load(AtomicOrdering::Relaxed);
-    shutdown(&shared, pipeline);
-    match measure_start {
-        Some(t0) => {
-            let dt = t0.elapsed().as_secs_f64();
-            println!(
-                "STEADY batch={nb}: {:7.3} games/sec  ({:5.1} rows/game, {:6.0} rows/sec) over {:.0}s after {:.0}s warmup",
-                (g - base_g) as f64 / dt,
-                (r - base_r) as f64 / (g - base_g).max(1) as f64,
-                (r - base_r) as f64 / dt,
-                dt,
-                warmup.as_secs_f64(),
-            );
-        }
-        None => println!("STEADY batch={nb}: run shorter than warmup; no measurement"),
-    }
+    let n_rows = total_decisions as usize;
+    write_cohort(&cfg.out, &rows, n_rows);
+    let secs = start.elapsed().as_secs_f64();
+    eprintln!(
+        "self-play (pipeline): {} matches, {} rows ({:.1}/match), wins[H,B]={:?}, {} threads, batch {}, conc {}, slots {}, {:.1}s, {:.0} matches/s, {:.0} rows/s",
+        finished,
+        n_rows,
+        n_rows as f64 / finished.max(1) as f64,
+        wins,
+        n_threads,
+        batch,
+        concurrency,
+        slots,
+        secs,
+        finished as f64 / secs,
+        n_rows as f64 / secs,
+    );
 }

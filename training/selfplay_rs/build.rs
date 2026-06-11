@@ -27,7 +27,6 @@ fn py_out(code: &str) -> String {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/cuda_event.cpp");
-    println!("cargo:rerun-if-changed=src/aoti.cpp");
 
     // --- compile the CUDA-event shim against the box's libtorch + CUDA headers ---
     let includes =
@@ -44,7 +43,7 @@ fn main() {
     let cxx11 = py_out("import torch; print(1 if torch.compiled_with_cxx11_abi() else 0)");
 
     let mut b = cc::Build::new();
-    b.cpp(true).std("c++17").file("src/cuda_event.cpp").file("src/aoti.cpp");
+    b.cpp(true).std("c++17").file("src/cuda_event.cpp");
     for line in includes.lines() {
         let p = line.trim();
         if !p.is_empty() {
