@@ -1,0 +1,19 @@
+# Training run artifacts (weights, snapshots, cohorts, logs, elo)
+runs/
+
+# Rust build output
+target/
+**/target/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Generated parity fixtures / cohorts (regenerate via training/scripts/*.mjs)
+*.cohort
+*.safetensors
+*.onnx
+fixtures/
+foxlite_core/tests/rules_traces.json
