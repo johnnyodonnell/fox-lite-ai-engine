@@ -24,6 +24,7 @@
         * Also, I'm not sure this can be trained via self-play. I could
             see issues with trying to bootstrap this from scratch if
             all of the moves are determined by Double Dummy.
+    - Train model to play good rounds instead of good matches
     - Any of the above already listed but with a bigger net
 
 * Approaches tried
