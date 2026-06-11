@@ -15,6 +15,7 @@ import datetime
 import glob
 import json
 import os
+import select
 import subprocess
 import time
 from pathlib import Path
@@ -53,6 +54,25 @@ def worker_env() -> dict:
     return env
 
 
+# A cohort takes seconds; an ack this late means the worker is wedged, not slow.
+# The protocol is one line per request, so the stdout buffer is empty whenever we
+# select() — no buffered-line/select mismatch.
+ACK_TIMEOUT_SEC = 300
+
+
+def read_ack(worker, timeout, what):
+    """One protocol line from the worker, or raise after `timeout` seconds so a
+    wedged worker (e.g. an internal deadlock) degrades to a respawn instead of
+    stalling the daemon forever."""
+    ready, _, _ = select.select([worker.stdout], [], [], timeout)
+    if not ready:
+        raise RuntimeError(f"selfplay worker {what} timeout ({timeout:.0f}s)")
+    line = worker.stdout.readline()
+    if not line:
+        raise RuntimeError("selfplay worker died")
+    return line
+
+
 def start_selfplay_worker(env):
     """Spawn the persistent `selfplay-serve` worker (CUDA/libtorch init once) and
     block until it reports ready. Returns the Popen handle."""
@@ -61,20 +81,19 @@ def start_selfplay_worker(env):
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         cwd=str(HERE), env=env, text=True, bufsize=1,
     )
-    line = p.stdout.readline()
-    if not line or not json.loads(line).get("ready"):
+    line = read_ack(p, ACK_TIMEOUT_SEC, "ready")
+    if not json.loads(line).get("ready"):
         raise RuntimeError(f"selfplay worker failed to start (got {line!r})")
     return p
 
 
 def run_cohort(worker, **cmd):
     """Send one cohort command to the worker and block until it writes the cohort
-    file and acks `done`. Raises if the worker died (empty read / broken pipe)."""
+    file and acks `done`. Raises if the worker died or wedged (the selfplay()
+    wrapper respawns it and retries once)."""
     worker.stdin.write(json.dumps(cmd) + "\n")
     worker.stdin.flush()
-    line = worker.stdout.readline()
-    if not line:
-        raise RuntimeError("selfplay worker died")
+    line = read_ack(worker, ACK_TIMEOUT_SEC, "ack")
     if not json.loads(line).get("done"):
         raise RuntimeError(f"selfplay worker bad ack: {line!r}")
 

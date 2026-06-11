@@ -258,7 +258,8 @@ fn acquire(shared: &Shared) -> Option<Box<InFlight>> {
             let id = r.started as u64;
             r.started += 1;
             r.in_flight += 1;
-            shared.in_flight.store(r.in_flight as u64, Ordering::Release);
+            // fetch_add, not a snapshot store — see complete_one for why.
+            shared.in_flight.fetch_add(1, Ordering::AcqRel);
             return Some(spawn_fresh(shared.seed, id));
         }
         if r.started >= shared.matches && r.in_flight == 0 {
@@ -286,17 +287,23 @@ fn finalize_local(out: &mut WorkerOut, g: &InFlight, winner: Player) {
 fn complete_one(shared: &Shared) {
     let mut r = shared.ready.lock().unwrap();
     r.in_flight -= 1;
-    let live = r.in_flight;
-    let done = r.started >= shared.matches && live == 0;
+    let done = r.started >= shared.matches && r.in_flight == 0;
     drop(r);
     // in_flight shrank, so the gather's partial-batch predicate (`q.len() >= in_flight`)
-    // may now fire. Publish the shrunk count under the *preinfer* lock so the store and
-    // the notify are serialized against gather's predicate check on the same mutex —
-    // otherwise gather can read the old count, decide to wait, and miss this notify
+    // may now fire. Decrement under the *preinfer* lock so the update and the notify
+    // are serialized against gather's predicate check on the same mutex — otherwise
+    // gather can read the old count, decide to wait, and miss this notify
     // (lost wakeup -> the cohort's tail hangs forever).
+    //
+    // A decrement, NOT a store of a count snapshotted under the ready lock: two
+    // concurrent completions can take this lock in the opposite order of their
+    // ready-lock decrements, and the stale-higher snapshot landing last pins the
+    // mirror above the true count — gather then never accepts the final partial
+    // batch and the cohort tail deadlocks. Increments/decrements commute, so the
+    // mirror stays exact under any interleaving.
     {
         let _q = shared.preinfer.inner.lock().unwrap();
-        shared.in_flight.store(live as u64, Ordering::Release);
+        shared.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
     shared.preinfer.not_empty.notify_all();
     // If the cohort just completed, wake everyone to shut down cleanly.
