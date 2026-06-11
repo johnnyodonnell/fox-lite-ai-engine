@@ -23,18 +23,16 @@ def export_onnx(net, path: str, input_size: int = INPUT_SIZE):
     import onnx
 
     ex = copy.deepcopy(net).to("cpu").float().eval()
-    dummy = torch.zeros(1, input_size, dtype=torch.float32)
+    # Batch-2 dummy + dynamic_shapes: the dynamo exporter specializes size-1
+    # dims, which bakes static batch reshapes into the attention layers.
+    dummy = torch.zeros(2, input_size, dtype=torch.float32)
     torch.onnx.export(
         ex,
-        dummy,
+        (dummy,),
         path,
         input_names=["input"],
         output_names=["policy", "value"],
-        dynamic_axes={
-            "input": {0: "batch"},
-            "policy": {0: "batch"},
-            "value": {0: "batch"},
-        },
+        dynamic_shapes=({0: torch.export.Dim("batch")},),
         opset_version=17,
     )
     # Embed weights into a single self-contained file for the browser.
