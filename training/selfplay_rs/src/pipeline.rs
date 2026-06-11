@@ -350,7 +350,7 @@ struct WorkItem {
 /// scatter thread, so this thread never blocks on the GPU and keeps it fed.
 fn inference_loop(
     shared: Arc<Shared>,
-    net: &Net,
+    forward: &dyn Fn(&Tensor) -> Tensor,
     dev: Device,
     batch: usize,
     work_tx: SyncSender<WorkItem>,
@@ -369,7 +369,7 @@ fn inference_loop(
         let x = Tensor::from_slice(&enc_flat)
             .reshape([m as i64, INPUT_SIZE as i64])
             .to_device(dev);
-        let (logits, _v) = net.forward(&x); // async on the stream
+        let logits = forward(&x); // async on the stream
         let logits = logits.to_kind(Kind::Float); // stays on GPU; scatter reads it back
         let event = CudaEvent::new();
         event.record(); // fires when this forward completes
@@ -495,6 +495,15 @@ impl ServeCmd {
 
 /// Generate one cohort with an already-loaded net (shared by `run` and `serve`).
 fn run_with_net(cfg: &Config, net: &Net, dev: Device) {
+    run_with_forward(cfg, &|x| net.forward(x).0, dev);
+}
+
+/// Generate one cohort with an injected policy forward ([m, INPUT_SIZE]
+/// encodings -> [m, NUM_CARDS] logits). Production wraps the real `Net`; the
+/// liveness stress test (tests/stress.rs) injects a stub so the pipeline's
+/// synchronization can be hammered without weights or a GPU. Returns the
+/// number of finished matches.
+pub fn run_with_forward(cfg: &Config, forward: &dyn Fn(&Tensor) -> Tensor, dev: Device) -> usize {
     let batch = cfg.batch.max(1).min(cfg.matches.max(1));
     let concurrency = cfg.concurrency.max(batch).min(cfg.matches.max(1));
     let n_threads = cfg.n_threads.max(1);
@@ -538,7 +547,7 @@ fn run_with_net(cfg: &Config, net: &Net, dev: Device) {
 
     // Inference runs on this thread (owns the net / GPU). On shutdown it returns
     // and drops `work_tx`, which drains and ends the scatter thread.
-    inference_loop(shared.clone(), net, dev, batch, work_tx);
+    inference_loop(shared.clone(), forward, dev, batch, work_tx);
     scatter.join().expect("scatter thread panicked");
 
     // Merge the per-worker cohort buffers (concatenated; row order is arbitrary,
@@ -571,4 +580,5 @@ fn run_with_net(cfg: &Config, net: &Net, dev: Device) {
         finished as f64 / secs,
         n_rows as f64 / secs,
     );
+    finished
 }
