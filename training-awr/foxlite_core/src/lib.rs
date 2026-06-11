@@ -10,9 +10,7 @@
 
 use rand::Rng;
 
-pub mod determinize;
 pub mod encode;
-pub mod mcts;
 
 pub const NUM_SUITS: usize = 3;
 pub const NUM_RANKS: usize = 11;

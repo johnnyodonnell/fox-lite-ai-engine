@@ -45,8 +45,7 @@ use rand::{Rng, SeedableRng};
 use tch::{Device, Kind, Tensor};
 
 use foxlite_core::encode::{encode_into, legal_mask, real_card_from_canon_index, INPUT_SIZE};
-use foxlite_core::mcts::temperature;
-use foxlite_core::{Phase, Player, State, NUM_CARDS};
+use foxlite_core::{Phase, Player, State, NUM_CARDS, TRICKS_PER_ROUND};
 
 use crate::aoti::AotiModel;
 use crate::cuda_event::CudaEvent;
@@ -74,6 +73,27 @@ fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+// --- move-selection temperature ------------------------------------------------
+pub const TEMP_OPENING: f64 = 1.0; // sampling temperature for the opening of a match
+pub const TEMP_FLOOR: f64 = 0.25; // floor temperature once fully annealed
+pub const TEMP_EARLY_TRICKS: u32 = 13; // match tricks held at the opening temperature (round 1)
+pub const TEMP_ANNEAL_TRICKS: u32 = 26; // match tricks over which temperature ramps to the floor (rounds 2-3)
+
+/// Self-play move-selection temperature, annealed over the whole match rather
+/// than resetting each round. Holds at `TEMP_OPENING` through round 1, then
+/// linearly anneals to `TEMP_FLOOR` across rounds 2-3. Round 4 is the earliest
+/// a match can end (6 pts/round max toward 21), so every potentially deciding
+/// round is played at the floor. (Inherited from the ISMCTS setup; with search
+/// gone this sampling is the run's only exploration.)
+pub fn temperature(round_num: u32, trick_num: u32) -> f64 {
+    let match_trick = (round_num - 1) * TRICKS_PER_ROUND + trick_num;
+    if match_trick <= TEMP_EARLY_TRICKS {
+        return TEMP_OPENING;
+    }
+    let frac = (((match_trick - TEMP_EARLY_TRICKS) as f64) / TEMP_ANNEAL_TRICKS as f64).min(1.0);
+    TEMP_OPENING + frac * (TEMP_FLOOR - TEMP_OPENING)
 }
 
 // --- per-game search-free self-play ------------------------------------------

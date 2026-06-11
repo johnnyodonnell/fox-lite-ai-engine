@@ -1,7 +1,8 @@
 //! selfplay_rs — Rust self-play worker + evaluator for fox-lite-ai-engine.
 
-// The MCTS workers allocate heavily from many threads (per-sim determinize /
-// walk / encode); glibc malloc arena contention was ~15% of worker on-CPU time.
+// The self-play workers allocate from many threads (per-decision encode /
+// rows); glibc malloc arena contention was ~15% of worker on-CPU time back in
+// the ISMCTS days, and mimalloc stays a cheap win.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

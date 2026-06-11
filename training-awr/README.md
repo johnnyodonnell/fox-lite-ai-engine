@@ -21,14 +21,14 @@ the match outcome `z = ±1` becomes a training row; the AWR update is
 i.e. the original run1 REINFORCE step with a clipped exponential weight in
 place of the linear advantage — and, unlike REINFORCE, explicitly off-policy:
 the big multi-model-version replay buffer is part of the algorithm.
-Evaluation (`evaluate_rs --sims 1`) and the deployed browser engine
-(`src/engine/neural.js`) both play raw-policy argmax.
+Evaluation (`evaluate_rs`) and the deployed browser engine
+(`src/engine/neural.js`) both play raw-policy argmax. There is no ISMCTS
+anywhere in this directory (it lives on in `training/`).
 
 ## Layout
 
 ```
-foxlite_core/     Rust crate: Lite rules + canonical encoder
-  src/mcts.rs         ISMCTS primitives (used by evaluate_rs only; self-play is search-free)
+foxlite_core/     Rust crate: Lite rules + canonical encoder (no search code)
 selfplay_rs/      Rust: self-play worker (selfplay_rs serve/bench) + evaluator (evaluate_rs)
   src/pipeline.rs     continuous decision-batched search-free pipeline (frame stream)
 net.py            PyTorch residual MLP (policy + value) — unchanged arch
@@ -91,8 +91,8 @@ Quick self-play throughput probe (no trainer):
   --threads 16 --batch 512
 ```
 
-Each snapshot is evaluated by `evaluate_rs` at `--sims 1` (raw-policy argmax,
-matching deployment): it picks an active opponent set (top-`--n-top` rated +
+Each snapshot is evaluated by `evaluate_rs` (raw-policy argmax, matching
+deployment): it picks an active opponent set (top-`--n-top` rated +
 `random` + `--n-anchors` frozen snapshots spread across the Elo range), plays
 `--eval-games` per opponent, then refits a global Bradley-Terry Elo over all
 accumulated results (random pinned at 0) into `pool.json`. Promotion to the

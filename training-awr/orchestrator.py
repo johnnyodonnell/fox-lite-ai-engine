@@ -10,9 +10,9 @@ off-policy replay is part of AWR, not a compromise), and republishes weights
 to `serving_weights.safetensors`, which the worker hot-reloads on mtime change.
 
 Every `--snapshot-every` it snapshots (safetensors + ONNX) and launches a
-detached `evaluate_rs` (Elo into pool.json; `--eval-sims 1` = raw-policy
-argmax, matching the deployed engine). Resumes from `<out-dir>/latest.pt`; a
-fresh run can warm-start from `--init-from` (a `.pt` checkpoint or a raw
+detached `evaluate_rs` (raw-policy argmax play — the deployed engine's
+behavior — + Elo into pool.json). Resumes from `<out-dir>/latest.pt`; a fresh
+run can warm-start from `--init-from` (a `.pt` checkpoint or a raw
 `.safetensors` snapshot).
 """
 
@@ -134,9 +134,6 @@ def parse_args():
     ap.add_argument("--no-aoti", action="store_true",
                     help="disable the fused AOTInductor self-play forward (use eager bf16)")
     ap.add_argument("--eval-games", type=int, default=200, help="matches per opponent")
-    ap.add_argument("--eval-sims", type=int, default=1,
-                    help="evaluate_rs ISMCTS sims; 1 degenerates to raw-policy "
-                         "argmax — the deployed (search-free) engine's behavior")
     ap.add_argument("--n-top", type=int, default=2)
     ap.add_argument("--n-anchors", type=int, default=3)
     return ap.parse_args()
@@ -258,8 +255,8 @@ def main():
     def launch_eval(st_path):
         if args.no_eval or not EVAL_BIN.exists():
             return
-        # Skip if a prior eval is still running (at sims=1 an eval is fast, but
-        # a full opponent pool can still outlast a short snapshot interval;
+        # Skip if a prior eval is still running (argmax eval is fast, but a
+        # full opponent pool can still outlast a short snapshot interval;
         # piling up evals would thrash the GPU vs self-play).
         lock = out_dir / "eval.lock"
         if lock.exists():
@@ -273,7 +270,7 @@ def main():
         try:
             proc = subprocess.Popen(
                 [str(EVAL_BIN), "--run-dir", str(out_dir), "--candidate", str(st_path),
-                 "--games", str(args.eval_games), "--sims", str(args.eval_sims),
+                 "--games", str(args.eval_games),
                  "--n-top", str(args.n_top), "--n-anchors", str(args.n_anchors),
                  "--seed", str(total_train_steps)],
                 cwd=str(HERE), stdout=logf, stderr=subprocess.STDOUT,

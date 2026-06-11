@@ -36,6 +36,5 @@ exec python orchestrator.py \
   --entropy-coef "${ENTROPY_COEF:-0.0}" \
   --buffer-capacity "${BUFFER_CAPACITY:-10000000}" \
   --eval-games "${EVAL_GAMES:-200}" \
-  --eval-sims "${EVAL_SIMS:-1}" \
   --seed "${SEED:-42}" \
   "${INIT_ARGS[@]}"

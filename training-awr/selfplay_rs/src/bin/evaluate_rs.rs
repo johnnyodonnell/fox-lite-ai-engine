@@ -6,11 +6,12 @@
 //! all accumulated match results (random pinned at 0), and pool.json is updated.
 //!
 //! Unlike chess there is no auto-serving — promotion to the browser model stays
-//! manual (training/promote.py). Net agents play by ISMCTS search (`--sims`
-//! simulations, root noise off, argmax-visit move); `random` is the floor anchor.
+//! manual (training/promote.py). Net agents play the **raw policy**: one
+//! batched forward per step, argmax over the legal-masked logits — exactly the
+//! deployed browser engine's behavior. No search; `random` is the floor anchor.
 //!
-//!   evaluate_rs --run-dir runs/run3 --candidate runs/run3/snapshots/snap_x.safetensors
-//!               [--games 80] [--sims 400] [--n-top 2] [--n-anchors 3] [--seed 0]
+//!   evaluate_rs --run-dir runs/run4 --candidate runs/run4/snapshots/snap_x.safetensors
+//!               [--games 80] [--n-top 2] [--n-anchors 3] [--seed 0]
 //!
 //! stdout: human-readable `[eval]` logs (opponents, per-pair results, ratings).
 
@@ -24,11 +25,7 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tch::{Device, Kind, Tensor};
 
-use foxlite_core::determinize::determinize;
 use foxlite_core::encode::{encode, legal_mask, real_card_from_canon_index, INPUT_SIZE};
-use foxlite_core::mcts::{
-    backprop, expand_node, new_root, sample_move, walk_to_leaf, Node, WalkResult,
-};
 use foxlite_core::{Phase, Player, State, NUM_CARDS};
 use selfplay_rs::net::Net;
 
@@ -49,147 +46,48 @@ fn round1(x: f64) -> f64 {
 // ---------------------------------------------------------------------------
 // Net evaluation (batched fp32 forward over a stack of encodings)
 // ---------------------------------------------------------------------------
-/// Run `net` over `m` encodings (`enc` is `m * INPUT_SIZE` f32) and return
-/// `(logits[m*NUM_CARDS], values[m])` on the host.
-fn eval_batch(net: &Net, enc: &[f32], m: usize) -> (Vec<f32>, Vec<f32>) {
+/// Run `net` over `m` encodings (`enc` is `m * INPUT_SIZE` f32) and return the
+/// policy logits (`m * NUM_CARDS`) on the host. The value head is unused.
+fn eval_batch(net: &Net, enc: &[f32], m: usize) -> Vec<f32> {
     let x = Tensor::from_slice(enc)
         .reshape([m as i64, INPUT_SIZE as i64])
         .to_device(net.device());
-    let (logits, values) = tch::no_grad(|| net.forward(&x));
+    let (logits, _values) = tch::no_grad(|| net.forward(&x));
     let lc = logits.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
-    let vc = values.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
     let mut lv = vec![0f32; m * NUM_CARDS];
     lc.copy_data(&mut lv, m * NUM_CARDS);
-    let mut vv = vec![0f32; m];
-    vc.copy_data(&mut vv, m);
-    (lv, vv)
+    lv
 }
 
-// ---------------------------------------------------------------------------
-// Synchronous batched ISMCTS (the eval analog of the self-play pipeline's
-// leaf batching: one search tree per concurrent game, with every game's leaf
-// for a given simulation gathered into a single net forward).
-// ---------------------------------------------------------------------------
-/// One game's ISMCTS state for the current decision: the true match state it is
-/// searching from (borrowed; never mutated — clones are determinized), the seat
-/// to move (`searcher`), and its tree arena (root at index 0).
-struct Holder<'a> {
-    state: &'a State,
-    searcher: Player,
-    arena: Vec<Node>,
-}
-
-/// A non-terminal leaf awaiting the batched net forward for its holder.
-struct EvalLeaf {
-    holder: usize,
-    path: Vec<usize>,
-    leaf_idx: usize,
-    det: State,    // the determinization walked to this leaf
-    mover: Player, // seat to move at the leaf
-    expand: bool,  // expand the leaf (false for a round-boundary value backprop)
-}
-
-/// Advance every holder's ISMCTS tree by `sims` simulations, batching all leaf
-/// evaluations across holders through `eval_fn` (one net forward per sim step).
-/// `eval_fn(enc, m)` maps `m` stacked encodings (`m * INPUT_SIZE` f32) to
-/// `(logits[m*NUM_CARDS], values[m])`. No root noise (this is evaluation, not
-/// self-play). `rng` drives the per-simulation determinization, consumed in
-/// holder order — so a single-holder run reproduces `mcts::run_search` exactly.
-fn run_simulations<F, R>(holders: &mut [Holder], sims: usize, rng: &mut R, mut eval_fn: F)
-where
-    F: FnMut(&[f32], usize) -> (Vec<f32>, Vec<f32>),
-    R: Rng + ?Sized,
-{
-    // Ensure every root is expanded (single batched pass over the true states).
-    let need: Vec<usize> =
-        (0..holders.len()).filter(|&i| !holders[i].arena[0].expanded).collect();
-    if !need.is_empty() {
-        let mut enc = vec![0f32; need.len() * INPUT_SIZE];
-        for (j, &i) in need.iter().enumerate() {
-            let e = encode(holders[i].state, holders[i].searcher);
-            enc[j * INPUT_SIZE..(j + 1) * INPUT_SIZE].copy_from_slice(&e);
-        }
-        let (logits, _values) = eval_fn(&enc, need.len());
-        for (j, &i) in need.iter().enumerate() {
-            let searcher = holders[i].searcher;
-            expand_node(
-                &mut holders[i].arena,
-                0,
-                holders[i].state,
-                &logits[j * NUM_CARDS..(j + 1) * NUM_CARDS],
-                searcher,
-            );
+/// Argmax of `logits` over the slots where `mask` is set (the raw-policy move;
+/// softmax is monotone, so masking + argmax on logits is exact).
+fn argmax_legal(logits: &[f32], mask: &[f32; NUM_CARDS]) -> usize {
+    let mut best = usize::MAX;
+    let mut best_l = f32::NEG_INFINITY;
+    for i in 0..NUM_CARDS {
+        if mask[i] != 0.0 && logits[i] > best_l {
+            best_l = logits[i];
+            best = i;
         }
     }
-
-    for _ in 0..sims {
-        // Gather one leaf per holder over a fresh determinization. Terminal
-        // paths backprop immediately; non-terminals are staged for the forward.
-        let mut leaves: Vec<EvalLeaf> = Vec::with_capacity(holders.len());
-        let mut path: Vec<usize> = Vec::new();
-        for (hi, holder) in holders.iter_mut().enumerate() {
-            let searcher = holder.searcher;
-            let mut det = determinize(holder.state, searcher, rng);
-            let mut boundary = holder.state.clone();
-            match walk_to_leaf(&mut holder.arena, 0, &mut det, searcher, &mut path, &mut boundary) {
-                WalkResult::Terminal { v_ref } => {
-                    backprop(&mut holder.arena, &path, v_ref);
-                }
-                WalkResult::BoundaryEval { mover } => {
-                    leaves.push(EvalLeaf { holder: hi, path: path.clone(), leaf_idx: 0, det: boundary, mover, expand: false });
-                }
-                WalkResult::Eval { mover } => {
-                    let leaf_idx = *path.last().unwrap();
-                    leaves.push(EvalLeaf { holder: hi, path: path.clone(), leaf_idx, det, mover, expand: true });
-                }
-            }
-        }
-        if leaves.is_empty() {
-            continue;
-        }
-
-        // Batch-evaluate the staged leaves through one net forward.
-        let mut enc = vec![0f32; leaves.len() * INPUT_SIZE];
-        for (j, lf) in leaves.iter().enumerate() {
-            let e = encode(&lf.det, lf.mover);
-            enc[j * INPUT_SIZE..(j + 1) * INPUT_SIZE].copy_from_slice(&e);
-        }
-        let (logits, values) = eval_fn(&enc, leaves.len());
-
-        // Scatter: expand each leaf (boundary backprops are value-only) and
-        // backprop its value (searcher POV).
-        for (j, lf) in leaves.iter().enumerate() {
-            let searcher = holders[lf.holder].searcher;
-            let value = values[j] as f64;
-            if lf.expand {
-                expand_node(
-                    &mut holders[lf.holder].arena,
-                    lf.leaf_idx,
-                    &lf.det,
-                    &logits[j * NUM_CARDS..(j + 1) * NUM_CARDS],
-                    searcher,
-                );
-            }
-            let v_ref = if lf.mover == searcher { value } else { -value };
-            backprop(&mut holders[lf.holder].arena, &lf.path, v_ref);
-        }
-    }
+    assert!(best != usize::MAX, "no legal move");
+    best
 }
 
 // ---------------------------------------------------------------------------
-// Players / match play (Fox Lite domain: ISMCTS net agent + random, no draws)
+// Players / match play (Fox Lite domain: raw-policy net agent + random, no draws)
 // ---------------------------------------------------------------------------
 enum Agent {
-    /// Neural agent: ISMCTS search (`sims` simulations, noise off) from each
-    /// mover's information set, picking the argmax-visit move.
-    Net { net: Net, sims: usize },
+    /// Neural agent: raw policy — argmax over the legal-masked logits of a
+    /// single forward, matching the deployed browser engine (no search).
+    Net(Net),
     Random,
 }
 
 impl Agent {
     /// Choose a canonical card index for every `(state, searcher)` pair where
-    /// this agent is to move. Net agents search all positions with one batched
-    /// ISMCTS so the GPU forwards span every concurrent game, not one at a time.
+    /// this agent is to move. Net agents stack every position into ONE forward
+    /// so the GPU work spans every concurrent game, not one at a time.
     fn select_moves(&self, states: &[&State], searchers: &[Player], rng: &mut StdRng) -> Vec<usize> {
         match self {
             Agent::Random => states
@@ -201,17 +99,22 @@ impl Agent {
                     legal[rng.gen_range(0..legal.len())]
                 })
                 .collect(),
-            Agent::Net { net, sims } => {
-                // Fresh tree per move (no reuse) — simpler and fine for eval volumes.
-                let mut holders: Vec<Holder> = states
+            Agent::Net(net) => {
+                let m = states.len();
+                let mut enc = vec![0f32; m * INPUT_SIZE];
+                for (j, (&s, &mover)) in states.iter().zip(searchers).enumerate() {
+                    let e = encode(s, mover);
+                    enc[j * INPUT_SIZE..(j + 1) * INPUT_SIZE].copy_from_slice(&e);
+                }
+                let logits = eval_batch(net, &enc, m);
+                states
                     .iter()
                     .zip(searchers)
-                    .map(|(&s, &searcher)| Holder { state: s, searcher, arena: new_root(searcher) })
-                    .collect();
-                run_simulations(&mut holders, *sims, rng, |enc, m| eval_batch(net, enc, m));
-                holders
-                    .iter()
-                    .map(|h| sample_move(&h.arena, 0, 0.0, rng)) // temperature 0 = argmax visits
+                    .enumerate()
+                    .map(|(j, (&s, &mover))| {
+                        let mask = legal_mask(s, mover);
+                        argmax_legal(&logits[j * NUM_CARDS..(j + 1) * NUM_CARDS], &mask)
+                    })
                     .collect()
             }
         }
@@ -449,7 +352,6 @@ fn main() {
     let run_dir = PathBuf::from(flag(&args, "--run-dir", "runs/run1"));
     let candidate = PathBuf::from(flag(&args, "--candidate", ""));
     let games: usize = flag(&args, "--games", "200").parse().unwrap();
-    let sims: usize = flag(&args, "--sims", "400").parse().unwrap();
     let n_top: usize = flag(&args, "--n-top", "2").parse().unwrap();
     let n_anchors: usize = flag(&args, "--n-anchors", "3").parse().unwrap();
     let seed: u64 = flag(&args, "--seed", "0").parse().unwrap();
@@ -461,27 +363,22 @@ fn main() {
         Device::Cpu
     };
 
-    // One-off A/B mode: --vs <safetensors|random> plays candidate (--sims) against
-    // a single opponent (--opp-sims, default --sims) and prints the result without
-    // touching pool.json. sims=1 degenerates to argmax of the raw policy (one
-    // simulation visits the max-prior child), so `--opp-sims 1` is "search off".
+    // One-off A/B mode: --vs <safetensors|random> plays candidate against a
+    // single opponent (both raw-policy argmax) and prints the result without
+    // touching pool.json.
     let vs = flag(&args, "--vs", "");
     if !vs.is_empty() {
-        let opp_sims: usize = flag(&args, "--opp-sims", &sims.to_string()).parse().unwrap();
         let mut rng = StdRng::seed_from_u64(seed);
         let cand_name = snapshot_stem(&candidate);
-        let cand = Agent::Net {
-            net: Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float),
-            sims,
-        };
+        let cand = Agent::Net(Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float));
         let opp_agent = if vs == RANDOM {
             Agent::Random
         } else {
-            Agent::Net { net: Net::load(&vs, dev, Kind::Float), sims: opp_sims }
+            Agent::Net(Net::load(&vs, dev, Kind::Float))
         };
         let wins = play_match(&cand, &opp_agent, games, &mut rng);
         println!(
-            "[ab] {cand_name} (sims={sims}) vs {} (sims={opp_sims}): {wins}/{games} ({:.1}%)",
+            "[ab] {cand_name} vs {}: {wins}/{games} ({:.1}%)",
             snapshot_stem(Path::new(&vs)),
             100.0 * wins as f64 / games.max(1) as f64
         );
@@ -521,10 +418,7 @@ fn main() {
     }
     println!("[eval] opponents={opponents:?}");
 
-    let cand = Agent::Net {
-        net: Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float),
-        sims,
-    };
+    let cand = Agent::Net(Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float));
 
     // Resolve each opponent's safetensors path up front so the match loop can
     // mutate pool.results without holding a borrow on the pool.
@@ -544,10 +438,7 @@ fn main() {
     for (opp, st) in &opp_specs {
         let opp_agent = match st {
             None => Agent::Random,
-            Some(p) => Agent::Net {
-                net: Net::load(run_dir.join(p).to_str().expect("utf8 path"), dev, Kind::Float),
-                sims,
-            },
+            Some(p) => Agent::Net(Net::load(run_dir.join(p).to_str().expect("utf8 path"), dev, Kind::Float)),
         };
         let wins = play_match(&cand, &opp_agent, games, &mut rng);
         pool.results.push(MatchResult {
@@ -601,20 +492,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use foxlite_core::mcts::run_search;
     use rand::SeedableRng;
-
-    /// Deterministic net surrogate: a pure function of the encoding, so the
-    /// batched and per-leaf paths agree byte-for-byte when fed the same leaf.
-    /// (Varies priors/values across leaves so the search isn't degenerate.)
-    fn dummy_from_enc(e: &[f32]) -> (Vec<f32>, f32) {
-        let mut logits = vec![0f32; NUM_CARDS];
-        for (j, l) in logits.iter_mut().enumerate() {
-            *l = e[j % e.len()] * 0.5 + (j as f32) * 0.013;
-        }
-        let mean: f32 = e.iter().sum::<f32>() / e.len() as f32;
-        (logits, mean.tanh())
-    }
 
     /// Play `steps` legal-first moves from a fresh match to reach a varied state.
     fn play_some(steps: usize, seed: u64) -> State {
@@ -634,50 +512,26 @@ mod tests {
         s
     }
 
-    fn root_child_visits(arena: &[Node]) -> Vec<(u8, u32)> {
-        arena[0].children.iter().map(|&(canon, c)| (canon, arena[c as usize].visit_count)).collect()
-    }
-
-    /// A single-holder batched search must reproduce `mcts::run_search` exactly:
-    /// same RNG order (one determinization per sim), same enc-derived eval, so
-    /// the resulting tree (root child visit counts) is identical. This pins the
-    /// batched path to the trusted reference search before any GPU is involved.
+    /// argmax_legal must pick the max-logit LEGAL slot over real game states,
+    /// never an illegal one — even when an illegal slot holds the global max.
     #[test]
-    fn batched_search_matches_run_search_single_holder() {
-        let sims = 48;
-        for seed in 0..60u64 {
-            let s = play_some((seed % 17) as usize, seed);
+    fn argmax_legal_picks_max_legal_slot() {
+        let mut rng = StdRng::seed_from_u64(99);
+        for seed in 0..120u64 {
+            let s = play_some((seed % 23) as usize, seed);
             if s.phase != Phase::Playing {
                 continue;
             }
-            let searcher = s.awaiting.unwrap();
-
-            // Reference: per-leaf run_search (eval via the enc-derived surrogate).
-            let mut rng_a = StdRng::seed_from_u64(seed ^ 0xABCD);
-            let arena_ref = run_search(&s, searcher, sims, false, &mut rng_a, |st, m| {
-                let (l, v) = dummy_from_enc(&encode(st, m));
-                (l, v as f64)
-            });
-
-            // Batched: one holder, same surrogate applied per row of the batch.
-            let mut rng_b = StdRng::seed_from_u64(seed ^ 0xABCD);
-            let mut holders = vec![Holder { state: &s, searcher, arena: new_root(searcher) }];
-            run_simulations(&mut holders, sims, &mut rng_b, |enc, m| {
-                let mut lo = vec![0f32; m * NUM_CARDS];
-                let mut vo = vec![0f32; m];
-                for r in 0..m {
-                    let (l, v) = dummy_from_enc(&enc[r * INPUT_SIZE..(r + 1) * INPUT_SIZE]);
-                    lo[r * NUM_CARDS..(r + 1) * NUM_CARDS].copy_from_slice(&l);
-                    vo[r] = v;
+            let mover = s.awaiting.unwrap();
+            let mask = legal_mask(&s, mover);
+            let logits: Vec<f32> = (0..NUM_CARDS).map(|_| rng.gen::<f32>() * 10.0 - 5.0).collect();
+            let pick = argmax_legal(&logits, &mask);
+            assert!(mask[pick] != 0.0, "picked an illegal slot (seed {seed})");
+            for j in 0..NUM_CARDS {
+                if mask[j] != 0.0 {
+                    assert!(logits[pick] >= logits[j], "not the max legal logit (seed {seed})");
                 }
-                (lo, vo)
-            });
-
-            assert_eq!(
-                root_child_visits(&arena_ref),
-                root_child_visits(&holders[0].arena),
-                "batched vs run_search visit mismatch (seed {seed})"
-            );
+            }
         }
     }
 }
