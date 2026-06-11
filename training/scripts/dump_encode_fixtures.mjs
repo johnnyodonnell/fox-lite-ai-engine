@@ -5,7 +5,9 @@
 //
 //   node training/scripts/dump_encode_fixtures.mjs [numGames] > training/fixtures/encode_fixtures.json
 //
-// Encodings are all 0/1, so we store only the set (nonzero) indices.
+// Encodings are mostly zeros but not 0/1-valued (history tokens carry card
+// indices 0..32), so `enc` stores sparse [index, value] pairs. The legal mask
+// IS 0/1, so `mask` stores only the set (nonzero) indices.
 
 import {
   createGame,
@@ -45,6 +47,12 @@ function setIdx(arr) {
   return r
 }
 
+function sparse(arr) {
+  const r = []
+  for (let i = 0; i < arr.length; i++) if (arr[i] !== 0) r.push([i, arr[i]])
+  return r
+}
+
 const numGames = parseInt(process.argv[2] || '60', 10)
 const cases = []
 for (let g = 0; g < numGames; g++) {
@@ -63,7 +71,7 @@ for (let g = 0; g < numGames; g++) {
     cases.push({
       state: serState(state),
       mover,
-      enc: setIdx(encode(state, mover)),
+      enc: sparse(encode(state, mover)),
       mask: setIdx(legalMask(state, mover)),
     })
     const hand = mover === HUMAN ? state.humanHand : state.botHand

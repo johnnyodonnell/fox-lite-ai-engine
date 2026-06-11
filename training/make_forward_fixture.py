@@ -3,7 +3,7 @@
 Encodes the first N states from the encoder fixture, runs a freshly-initialized
 FoxNet in fp32, and writes:
   fixtures/fwd_weights.safetensors   - net params (Rust tch loads these)
-  fixtures/fwd_fixture.safetensors    - input[N,230], ref_logits[N,33], ref_value[N]
+  fixtures/fwd_fixture.safetensors    - input[N,INPUT_SIZE], ref_logits[N,33], ref_value[N]
   fixtures/fwd_model.onnx             - ONNX export (browser parity, checked in Phase 7)
 
 Run (on asus-nvidia, in the project venv):

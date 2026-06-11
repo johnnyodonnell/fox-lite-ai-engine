@@ -3,7 +3,11 @@
 // Node, using the JS encoder + the same argmax/canonical-mapping as neural.js,
 // and play full matches (bot=net, opponent=random). Assert every bot move is legal.
 //
-//   node training/scripts/test_browser_engine_e2e.mjs
+//   node training/scripts/test_browser_engine_e2e.mjs [model.onnx]
+//
+// The model path defaults to the deployed public/models/current.onnx; pass a
+// freshly exported model (e.g. training/fixtures/fwd_model.onnx) to gate an
+// encoder/net change before promotion.
 
 import { resolve } from 'node:path'
 
@@ -23,7 +27,8 @@ import { encode, legalMask, realCardFromCanonIndex, NUM_CARDS } from '../../src/
 ort.env.wasm.wasmPaths = resolve('node_modules/onnxruntime-web/dist') + '/'
 ort.env.wasm.numThreads = 1
 
-const session = await ort.InferenceSession.create('public/models/current.onnx', {
+const modelPath = process.argv[2] ?? 'public/models/current.onnx'
+const session = await ort.InferenceSession.create(modelPath, {
   executionProviders: ['wasm'],
 })
 

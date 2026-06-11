@@ -8,36 +8,38 @@
 // This is the single source of truth the Rust (foxlite_core) and Python
 // (training/encode.py) encoders are parity-checked against.
 
-import { SUITS, RANKS, cardId, TRICKS_PER_ROUND, TARGET_SCORE, HUMAN, BOT } from './game.js'
+import { SUITS, RANKS, cardId, TRICKS_PER_ROUND, TARGET_SCORE, HUMAN } from './game.js'
 
 export const NUM_SUITS = SUITS.length // 3
 export const NUM_RANKS = RANKS.length // 11
 export const NUM_CARDS = NUM_SUITS * NUM_RANKS // 33
 
-// Layout (canonical), see plan. Offsets computed from the block sizes.
+// Layout (canonical): a history-token block followed by one-hot static blocks.
+//
+// History tokens (v2): one token per play event of the current round, in play
+// order (trickHistory order — the in-progress trick's lead is just the last
+// token). Each token is [canonical card index, played-by-self, valid]. Padded
+// slots are all-zero; the valid bit disambiguates padding from a real card
+// index 0 and is the net's attention/pooling mask.
+export const HIST_TOKENS = 2 * TRICKS_PER_ROUND // 26 (max events in a round)
+export const TOKEN_FEATS = 3 // [card index 0..32, played-by-self 0/1, valid 0/1]
+const HIST = HIST_TOKENS * TOKEN_FEATS // 78
 const OWN_HAND = NUM_CARDS // 33
-const PLAYED_SELF = NUM_CARDS // 33
-const PLAYED_OPP = NUM_CARDS // 33
 const TRUMP_RANK = NUM_RANKS // 11
-const OPP_VOIDS = NUM_SUITS // 3
-const LED = NUM_CARDS + 1 // 34 (33 card one-hot + "no led / I'm leading" flag)
 const SELF_TRICKS = TRICKS_PER_ROUND + 1 // 14 (0..13)
 const OPP_TRICKS = TRICKS_PER_ROUND + 1 // 14
 const TRICK_NUM = TRICKS_PER_ROUND // 13 (1..13)
 const SCORE_SLOTS = TARGET_SCORE // 21 (0..20)
 
 export const INPUT_SIZE =
+  HIST +
   OWN_HAND +
-  PLAYED_SELF +
-  PLAYED_OPP +
   TRUMP_RANK +
-  OPP_VOIDS +
-  LED +
   SELF_TRICKS +
   OPP_TRICKS +
   TRICK_NUM +
   SCORE_SLOTS +
-  SCORE_SLOTS // 230
+  SCORE_SLOTS // 205
 
 const suitIndex = (suit) => SUITS.indexOf(suit)
 
@@ -72,30 +74,11 @@ export function realCardFromCanonIndex(ci, trumpIdx) {
   return { suit, rank, id: cardId(suit, rank) }
 }
 
-// Opponent (the seat that is NOT `mover`) void-suit inference from history.
-function opponentVoids(trickHistory, opponent) {
-  const voids = new Set()
-  const byTrick = new Map()
-  for (const ev of trickHistory) {
-    if (!byTrick.has(ev.trick)) byTrick.set(ev.trick, [])
-    byTrick.get(ev.trick).push(ev)
-  }
-  for (const events of byTrick.values()) {
-    if (events.length < 2) continue
-    const [lead, follow] = events
-    if (follow.player === opponent && follow.card.suit !== lead.card.suit) {
-      voids.add(suitIndex(lead.card.suit))
-    }
-  }
-  return voids
-}
-
 // Encode `state` from `mover`'s perspective. Returns Float32Array(INPUT_SIZE).
 export function encode(state, mover = state.awaiting) {
   const out = new Float32Array(INPUT_SIZE)
   const trumpIdx = suitIndex(state.trump.suit)
   const moverIsHuman = mover === HUMAN
-  const opp = moverIsHuman ? BOT : HUMAN
 
   const ownHand = moverIsHuman ? state.humanHand : state.botHand
   const selfTricks = moverIsHuman ? state.tricksWon.human : state.tricksWon.bot
@@ -104,32 +87,24 @@ export function encode(state, mover = state.awaiting) {
   const oppScore = moverIsHuman ? state.score.bot : state.score.human
 
   let cur = 0
+  // history tokens (play order; padded slots stay all-zero)
+  const events = state.trickHistory
+  if (events.length > HIST_TOKENS) {
+    throw new Error(`trickHistory length ${events.length} > ${HIST_TOKENS}`)
+  }
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]
+    out[cur + i * TOKEN_FEATS] = canonCardIndex(ev.card, trumpIdx)
+    out[cur + i * TOKEN_FEATS + 1] = ev.player === mover ? 1 : 0
+    out[cur + i * TOKEN_FEATS + 2] = 1
+  }
+  cur += HIST
   // own hand
   for (const c of ownHand) out[cur + canonCardIndex(c, trumpIdx)] = 1
   cur += OWN_HAND
-  // played by self / by opp
-  const playedSelfBase = cur
-  const playedOppBase = cur + PLAYED_SELF
-  for (const ev of state.trickHistory) {
-    const base = ev.player === mover ? playedSelfBase : playedOppBase
-    out[base + canonCardIndex(ev.card, trumpIdx)] = 1
-  }
-  cur += PLAYED_SELF + PLAYED_OPP
   // trump rank (suit is implied = canonical slot 0)
   out[cur + (state.trump.rank - 1)] = 1
   cur += TRUMP_RANK
-  // opponent voids (canonical suit slots)
-  for (const realSuit of opponentVoids(state.trickHistory, opp)) {
-    out[cur + canonSuit(realSuit, trumpIdx)] = 1
-  }
-  cur += OPP_VOIDS
-  // current led card + "no led / I'm leading" flag
-  if (state.ledCard) {
-    out[cur + canonCardIndex(state.ledCard, trumpIdx)] = 1
-  } else {
-    out[cur + NUM_CARDS] = 1
-  }
-  cur += LED
   // tricks won
   out[cur + Math.min(selfTricks, TRICKS_PER_ROUND)] = 1
   cur += SELF_TRICKS

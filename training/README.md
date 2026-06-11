@@ -11,7 +11,7 @@ search.
 ```
 foxlite_core/     Rust crate: Lite rules (port of src/engine/game.js) + canonical encoder
 selfplay_rs/      Rust: self-play worker (selfplay_rs) + evaluator (evaluate_rs), tch forward
-net.py            PyTorch residual MLP (policy + value)
+net.py            PyTorch net: transformer history encoder + residual MLP (policy + value)
 encode.py         canonical encoder (parity reference)
 train.py          REINFORCE update (advantage = z - V; + value MSE + entropy bonus)
 orchestrator.py   strict-sync loop: selfplay -> train -> publish -> (snapshot + eval)

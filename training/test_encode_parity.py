@@ -23,6 +23,10 @@ def set_indices(v: np.ndarray) -> list:
     return [int(i) for i in np.nonzero(v)[0]]
 
 
+def sparse(v: np.ndarray) -> list:
+    return [[int(i), float(v[i])] for i in np.nonzero(v)[0]]
+
+
 def main() -> int:
     if not FIXTURE.exists():
         print(f"missing fixture {FIXTURE}\n"
@@ -36,7 +40,7 @@ def main() -> int:
 
     for i, case in enumerate(cases):
         state, mover = case["state"], case["mover"]
-        enc = set_indices(encode(state, mover))
+        enc = sparse(encode(state, mover))
         assert enc == case["enc"], f"case {i}: encoding mismatch"
         mask = set_indices(legal_mask(state, mover))
         assert mask == case["mask"], f"case {i}: legal mask mismatch"

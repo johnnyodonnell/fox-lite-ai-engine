@@ -13,7 +13,7 @@ import sys
 
 import numpy as np
 
-from encode import INPUT_SIZE, NUM_CARDS
+from encode import HIST, HIST_TOKENS, INPUT_SIZE, NUM_CARDS, TOKEN_FEATS
 
 ROW_FLOATS = INPUT_SIZE + NUM_CARDS + 2
 
@@ -43,15 +43,29 @@ def main() -> int:
     chosen_mask = m[np.arange(c["n"]), a]
     legal_ok = bool(np.all(chosen_mask == 1.0))
     z_ok = bool(np.all(np.isin(z, [-1.0, 1.0])))
+    # history tokens: [card 0..32, self 0/1, valid 0/1] per slot, valid bits a
+    # prefix (events fill slots in play order, padding only at the tail)
+    tok = c["states"][:, :HIST].reshape(-1, HIST_TOKENS, TOKEN_FEATS)
+    card, self_bit, valid = tok[:, :, 0], tok[:, :, 1], tok[:, :, 2]
+    tok_ok = bool(
+        np.all((card >= 0) & (card < NUM_CARDS) & (card == np.floor(card)))
+        and np.all(np.isin(self_bit, [0.0, 1.0]))
+        and np.all(np.isin(valid, [0.0, 1.0]))
+        and np.all(np.diff(valid, axis=1) <= 0)  # prefix-monotone
+        and np.all(card * (1.0 - valid) == 0.0)  # padded slots all-zero
+        and np.all(self_bit * (1.0 - valid) == 0.0)
+    )
     # each input row should have a fixed number of one-hot blocks set; spot-check
     # that own-hand counts are in 1..13 (mover always holds >=1 card on its turn)
-    own_hand_counts = c["states"][:, :NUM_CARDS].sum(axis=1)
+    own_hand_counts = c["states"][:, HIST:HIST + NUM_CARDS].sum(axis=1)
     print(f"rows={c['n']}")
     print(f"  chosen-action-legal: {legal_ok}")
     print(f"  z in {{-1,1}}: {z_ok}   z.mean={float(z.mean()):+.3f}")
+    print(f"  history tokens well-formed: {tok_ok}")
+    print(f"  valid-token count range: [{int(valid.sum(axis=1).min())},{int(valid.sum(axis=1).max())}]")
     print(f"  action idx range: [{int(a.min())},{int(a.max())}]")
     print(f"  own-hand card count range: [{int(own_hand_counts.min())},{int(own_hand_counts.max())}]")
-    ok = legal_ok and z_ok
+    ok = legal_ok and z_ok and tok_ok
     print("COHORT OK" if ok else "COHORT BAD")
     return 0 if ok else 1
 
