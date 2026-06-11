@@ -1,37 +1,37 @@
-//! Continuous ISMCTS self-play pipeline (100% Rust, leaf-batched).
+//! Continuous search-free self-play pipeline (100% Rust, decision-batched).
 //!
-//! Port of the chess-ai-engine pipeline topology onto Fox-Lite, with the heavy
-//! inference stack (AOTI / CUDA-graph / bf16 / pinned slots) swapped for the
-//! simple `tch` fp32 `Net::forward` — the Fox-Lite net is tiny, so a plain forward
-//! keeps the GPU fed and the code small.
+//! AWR data generation: NO search. Each decision is one batched GPU forward of
+//! the true match state; the move is sampled straight from the policy head
+//! (illegal slots masked out, logits annealed by the match temperature). Rows
+//! carry (state, legal mask, action, z) for the Python AWR trainer
+//! (advantage-weighted regression on the match outcome).
 //!
-//! Topology:
-//!   - N worker threads each drive one game's ISMCTS FSM until it yields ONE leaf
-//!     to evaluate (root expand or a simulation leaf) or the game finishes (rows
-//!     streamed to the sink). Workers claim scattered games in small chunks from
-//!     the ply-bucketed return queue, highest ply first — the fast lane that keeps
-//!     nearly-finished games finishing and the completion stream smooth. An empty
-//!     return queue => spawn a fresh game (dynamic game count, self-regulating to
-//!     fill the pipe);
+//! Topology (inherited unchanged from the ISMCTS pipeline this replaces):
+//!   - N worker threads each drive one game's next decision: apply the move
+//!     sampled from the previous forward's logits, then stage the next
+//!     decision's encoding, or stream the finished game's rows to the sink.
+//!     Workers claim scattered games in small chunks from the ply-bucketed
+//!     return queue, highest ply first — the fast lane that keeps
+//!     nearly-finished games finishing and the completion stream smooth. An
+//!     empty return queue => spawn a fresh game (dynamic game count,
+//!     self-regulating to fill the pipe);
 //!   - ONE bounded ply-priority pre-inference queue (most real-moves-made first),
 //!     so games closest to finishing are evaluated soonest;
-//!   - ONE inference thread: gathers BATCH leaf encodings, runs the fp32 forward,
+//!   - ONE inference thread: gathers BATCH decision encodings, runs the forward,
 //!     records a CUDA event, hands the in-flight forward to the scatter thread,
 //!     and loops to launch the next batch. It also mtime-polls the weights sidecar
-//!     and `Net::reload`s in place between batches (weight hot-reload);
-//!   - ONE scatter thread: waits the event, reads (logits, value) back to the
-//!     host, attaches each game's result, and bulk-pushes the batch back into the
+//!     and reloads in place between batches (weight hot-reload);
+//!   - ONE scatter thread: waits the event, reads the logits back to the host,
+//!     attaches each game's result, and bulk-pushes the batch back into the
 //!     return queue.
 //!
 //! Both shared queues are ply-bucketed (one Vec per ply count), NOT comparison
 //! heaps: push is O(1) and bulk drains move whole buckets, so every lock hold is
-//! tiny. The previous global Mutex<BinaryHeap> pair spent ~40% of worker on-CPU
-//! time in lock machinery (the 4096-pop gather hold convoyed all workers every
-//! batch).
+//! tiny.
 //!
-//! Each ISMCTS decision re-determinizes the hidden cards every simulation (true
-//! ISMCTS); the leaf-batching means a single game contributes ~`sims` forwards per
-//! move, all interleaved with every other in-flight game's forwards.
+//! vs ISMCTS self-play: a move costs 1 forward instead of ~sims, so games/sec
+//! rises by ~two orders of magnitude and the consumer (trainer ingest), not the
+//! GPU, becomes the side to keep fast.
 
 use std::io::{self, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -41,15 +41,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use tch::{Device, Kind, Tensor};
 
-use foxlite_core::determinize::determinize_into;
-use foxlite_core::encode::{encode, encode_into, real_card_from_canon_index, INPUT_SIZE};
-use foxlite_core::mcts::{
-    add_dirichlet_noise, backprop, expand_node, new_root, sample_move, temperature, visits_to_pi,
-    walk_to_leaf, Node, WalkResult,
-};
+use foxlite_core::encode::{encode_into, legal_mask, real_card_from_canon_index, INPUT_SIZE};
+use foxlite_core::mcts::temperature;
 use foxlite_core::{Phase, Player, State, NUM_CARDS};
 
 use crate::aoti::AotiModel;
@@ -59,12 +55,10 @@ use crate::net::Net;
 pub const ENC_LEN: usize = INPUT_SIZE; // 230
 pub const POLICY_SIZE: usize = NUM_CARDS; // 33
 
-/// One finished-game training row: (state[230], pi[33], z).
-pub type Row = (Vec<f32>, [f32; NUM_CARDS], f32);
+/// One finished-game training row: (state[230], legal_mask[33], action, z).
+pub type Row = (Vec<f32>, [f32; NUM_CARDS], u8, f32);
 
 pub struct Config {
-    pub sims: usize,
-    pub add_root_noise: bool,
     pub seed: u64,
     pub n_threads: usize,
     pub n_slots: usize, // GPU forwards kept in flight (inference runs ahead of scatter)
@@ -82,71 +76,46 @@ fn mix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-// --- per-game ISMCTS FSM ------------------------------------------------------
-enum GamePhase {
-    NeedRootExpand,
-    Simulating(usize),
-}
-enum LeafKind {
-    RootExpand,
-    SimLeaf,
-    /// Round boundary (match not over): backprop the fresh net value of the
-    /// pre-move state under the current determinization; no expansion.
-    Boundary,
-}
-struct LeafCtx {
-    kind: LeafKind,
-    leaf_idx: usize,
-    mover: Player, // seat to move at the leaf
-}
+// --- per-game search-free self-play ------------------------------------------
 struct EvalResult {
     logits: Arc<Vec<f32>>, // whole batch's policy [m * 33]; the worker slices its row
     row: usize,
-    value: f32,
 }
 /// One recorded decision; flushed to a row with z = ±1 when the match ends.
 struct Decision {
     state_enc: Vec<f32>,
-    pi: [f32; NUM_CARDS],
+    mask: [f32; NUM_CARDS], // legal moves at the decision (canonical slots)
+    action: u8,             // canonical index of the move taken
     seat: Player,
 }
 struct InFlight {
-    state: State,     // the TRUE match state
-    searcher: Player, // seat to move at the current decision (= state.awaiting)
-    arena: Vec<Node>, // ISMCTS tree for the current decision
+    state: State, // the TRUE match state
+    mover: Player, // seat to move at the staged decision (= state.awaiting)
     rng: StdRng,
     decisions: Vec<Decision>,
-    phase: GamePhase,
     pending: Option<EvalResult>,
-    leaf_ctx: Option<LeafCtx>,
-    // Per-game scratch reused across simulations (a game stages exactly one leaf
-    // at a time, so one of each suffices; clone_from keeps their heap buffers).
-    det: State,           // walk determinization (mutated to the leaf)
-    leaf_det: State,      // leaf/boundary/root state preserved across the GPU roundtrip
-    path: Vec<usize>,     // walk path of the in-flight leaf (backprop target)
-    staged_enc: Vec<f32>, // encoding of the leaf currently awaiting a forward
+    staged_enc: Vec<f32>,          // encoding of the decision awaiting a forward
+    staged_mask: [f32; NUM_CARDS], // legal mask of that decision
+}
+
+fn new_game(seed: u64) -> InFlight {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let state = State::new_match(&mut rng);
+    let mover = state.awaiting.expect("fresh match awaits a leader");
+    InFlight {
+        state,
+        mover,
+        rng,
+        decisions: Vec::new(),
+        pending: None,
+        staged_enc: Vec::new(),
+        staged_mask: [0.0; NUM_CARDS],
+    }
 }
 
 fn spawn_fresh(shared: &Shared) -> InFlight {
     let id = shared.id_counter.fetch_add(1, AtomicOrdering::Relaxed);
-    let seed = mix64(shared.config.seed ^ mix64(id.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
-    let mut rng = StdRng::seed_from_u64(seed);
-    let state = State::new_match(&mut rng);
-    let searcher = state.awaiting.expect("fresh match awaits a leader");
-    InFlight {
-        det: state.clone(),
-        leaf_det: state.clone(),
-        state,
-        searcher,
-        arena: new_root(searcher),
-        rng,
-        decisions: Vec::new(),
-        phase: GamePhase::NeedRootExpand,
-        pending: None,
-        leaf_ctx: None,
-        path: Vec::new(),
-        staged_enc: Vec::new(),
-    }
+    new_game(mix64(shared.config.seed ^ mix64(id.wrapping_mul(0x9E37_79B9_7F4A_7C15))))
 }
 
 fn finalize_rows(g: &mut InFlight) -> Vec<Row> {
@@ -155,78 +124,86 @@ fn finalize_rows(g: &mut InFlight) -> Vec<Row> {
         .drain(..)
         .map(|d| {
             let z = if d.seat == winner { 1.0f32 } else { -1.0f32 };
-            (d.state_enc, d.pi, z)
+            (d.state_enc, d.mask, d.action, z)
         })
         .collect()
 }
 
-/// Apply the forward result for the staged leaf: expand it and backprop (or, for
-/// the root, expand + add noise). Mirrors the eval branch of `mcts::run_search`.
-fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
-    let ctx = g.leaf_ctx.take().expect("pending result without leaf_ctx");
-    let logits = &res.logits[res.row * POLICY_SIZE..(res.row + 1) * POLICY_SIZE];
-    let value = res.value as f64;
-    match ctx.kind {
-        LeafKind::RootExpand => {
-            expand_node(&mut g.arena, 0, &g.leaf_det, logits, g.searcher);
-            if config.add_root_noise {
-                add_dirichlet_noise(&mut g.arena, 0, &mut g.rng);
-            }
-            g.phase = GamePhase::Simulating(0);
-        }
-        LeafKind::SimLeaf => {
-            expand_node(&mut g.arena, ctx.leaf_idx, &g.leaf_det, logits, g.searcher);
-            let v_ref = if ctx.mover == g.searcher { value } else { -value };
-            backprop(&mut g.arena, &g.path, v_ref);
-            if let GamePhase::Simulating(s) = g.phase {
-                g.phase = GamePhase::Simulating(s + 1);
-            }
-        }
-        LeafKind::Boundary => {
-            let v_ref = if ctx.mover == g.searcher { value } else { -value };
-            backprop(&mut g.arena, &g.path, v_ref);
-            if let GamePhase::Simulating(s) = g.phase {
-                g.phase = GamePhase::Simulating(s + 1);
+/// Sample a canonical card index from softmax(logits / temp) over the legal
+/// slots. `temp <= 0` degenerates to argmax over the legal logits.
+fn sample_masked<R: Rng + ?Sized>(
+    logits: &[f32],
+    mask: &[f32; NUM_CARDS],
+    temp: f64,
+    rng: &mut R,
+) -> usize {
+    let mut maxl = f64::NEG_INFINITY;
+    let mut arg = usize::MAX;
+    for i in 0..NUM_CARDS {
+        if mask[i] > 0.0 {
+            let l = logits[i] as f64;
+            if l > maxl {
+                maxl = l;
+                arg = i;
             }
         }
     }
+    assert!(arg != usize::MAX, "no legal move to sample");
+    if temp <= 0.0 {
+        return arg;
+    }
+    let mut w = [0.0f64; NUM_CARDS];
+    let mut total = 0.0;
+    for i in 0..NUM_CARDS {
+        if mask[i] > 0.0 {
+            let e = (((logits[i] as f64) - maxl) / temp).exp();
+            w[i] = e;
+            total += e;
+        }
+    }
+    let r = rng.gen::<f64>() * total;
+    let mut acc = 0.0;
+    for (i, &wi) in w.iter().enumerate() {
+        if wi > 0.0 {
+            acc += wi;
+            if r < acc {
+                return i;
+            }
+        }
+    }
+    arg
 }
 
-/// Pick the real move from the finished search, record the decision, play it, and
-/// advance the true state to the next decision. Returns true if the match ended.
-fn step_move(g: &mut InFlight) -> bool {
+/// Apply the forward result for the staged decision: sample a move from the
+/// legal-masked, temperature-annealed policy, record the decision, play it, and
+/// advance the true state to the next decision (or to MatchOver). The value
+/// head is unused here — z comes from the match outcome at finalize.
+fn apply_result(g: &mut InFlight, res: EvalResult) {
+    let logits = &res.logits[res.row * POLICY_SIZE..(res.row + 1) * POLICY_SIZE];
+    // Selection temperature, annealed over the match (same schedule the ISMCTS
+    // runs trained under); exploration comes solely from this sampling.
     let temp = temperature(g.state.round_num, g.state.trick_num);
-    // Policy target: RAW visit proportions (AlphaZero). The annealed temperature
-    // applies only to move *selection* below — sharpening the stored target too
-    // (visits^(1/temp)) discards the search's soft information and feeds an
-    // overconfidence loop through the PUCT prior term.
-    let pi = visits_to_pi(&g.arena, 0, 1.0);
-    let state_enc = encode(&g.state, g.searcher);
-    g.decisions.push(Decision { state_enc, pi, seat: g.searcher });
+    let action = sample_masked(logits, &g.staged_mask, temp, &mut g.rng);
+    g.decisions.push(Decision {
+        state_enc: std::mem::take(&mut g.staged_enc),
+        mask: g.staged_mask,
+        action: action as u8,
+        seat: g.mover,
+    });
 
-    let mv = sample_move(&g.arena, 0, temp, &mut g.rng);
-    let card = real_card_from_canon_index(mv, g.state.trump.suit);
+    let card = real_card_from_canon_index(action, g.state.trump.suit);
     g.state.apply(card);
     loop {
         match g.state.phase {
-            Phase::Playing => break,
+            Phase::Playing | Phase::MatchOver => break,
             Phase::TrickComplete => g.state.advance_after_trick(),
             Phase::RoundOver => {
                 let mut rng = std::mem::replace(&mut g.rng, StdRng::seed_from_u64(0));
                 g.state.end_round(&mut rng);
                 g.rng = rng;
             }
-            Phase::MatchOver => break,
         }
     }
-    if g.state.phase == Phase::MatchOver {
-        return true;
-    }
-    g.searcher = g.state.awaiting.expect("next decision awaits a mover");
-    g.arena.clear(); // fresh root, arena Vec capacity kept
-    g.arena.push(Node::new(0.0, g.searcher));
-    g.phase = GamePhase::NeedRootExpand;
-    false
 }
 
 enum Advance {
@@ -234,61 +211,15 @@ enum Advance {
     Done(Vec<Row>),
 }
 
-/// Drive the game until it stages one leaf for evaluation or finishes.
-fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
-    loop {
-        match g.phase {
-            GamePhase::NeedRootExpand => {
-                encode_into(&g.state, g.searcher, &mut g.staged_enc);
-                g.leaf_det.clone_from(&g.state);
-                g.leaf_ctx = Some(LeafCtx {
-                    kind: LeafKind::RootExpand,
-                    leaf_idx: 0,
-                    mover: g.searcher,
-                });
-                return Advance::Eval;
-            }
-            GamePhase::Simulating(s) => {
-                if s >= config.sims {
-                    if step_move(g) {
-                        return Advance::Done(finalize_rows(g));
-                    }
-                    continue;
-                }
-                determinize_into(&g.state, g.searcher, &mut g.rng, &mut g.det);
-                match walk_to_leaf(&mut g.arena, 0, &mut g.det, g.searcher, &mut g.path, &mut g.leaf_det) {
-                    WalkResult::Terminal { v_ref } => {
-                        backprop(&mut g.arena, &g.path, v_ref);
-                        g.phase = GamePhase::Simulating(s + 1);
-                    }
-                    WalkResult::BoundaryEval { mover } => {
-                        // walk_to_leaf left the pre-move boundary state in leaf_det
-                        encode_into(&g.leaf_det, mover, &mut g.staged_enc);
-                        g.leaf_ctx = Some(LeafCtx {
-                            kind: LeafKind::Boundary,
-                            leaf_idx: 0, // unused (no expansion)
-                            mover,
-                        });
-                        return Advance::Eval;
-                    }
-                    WalkResult::Eval { mover } => {
-                        let leaf_idx = *g.path.last().unwrap();
-                        // Preserve the leaf's determinization across the GPU
-                        // roundtrip (expand_node needs it); g.det is overwritten
-                        // by the next simulation's determinize_into.
-                        std::mem::swap(&mut g.det, &mut g.leaf_det);
-                        encode_into(&g.leaf_det, mover, &mut g.staged_enc);
-                        g.leaf_ctx = Some(LeafCtx {
-                            kind: LeafKind::SimLeaf,
-                            leaf_idx,
-                            mover,
-                        });
-                        return Advance::Eval;
-                    }
-                }
-            }
-        }
+/// Stage the next decision for evaluation, or finalize a finished match.
+fn advance_until_eval_or_done(g: &mut InFlight) -> Advance {
+    if g.state.phase == Phase::MatchOver {
+        return Advance::Done(finalize_rows(g));
     }
+    g.mover = g.state.awaiting.expect("decision awaits a mover");
+    encode_into(&g.state, g.mover, &mut g.staged_enc);
+    g.staged_mask = legal_mask(&g.state, g.mover);
+    Advance::Eval
 }
 
 // --- ply-bucketed priority queue (most real moves made first) -----------------
@@ -476,9 +407,9 @@ fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
             }
         };
         if let Some(res) = g.pending.take() {
-            apply_result(&mut g, res, &shared.config);
+            apply_result(&mut g, res);
         }
-        match advance_until_eval_or_done(&mut g, &shared.config) {
+        match advance_until_eval_or_done(&mut g) {
             Advance::Eval => {
                 if shared.preinfer.push(g).is_err() {
                     return; // closed (shutdown)
@@ -493,19 +424,10 @@ fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
     }
 }
 
-fn requeue_scattered(
-    shared: &Shared,
-    logits: Arc<Vec<f32>>,
-    values: &[f32],
-    mut games: Vec<Box<InFlight>>,
-) {
+fn requeue_scattered(shared: &Shared, logits: Arc<Vec<f32>>, mut games: Vec<Box<InFlight>>) {
     // Attach results outside the lock; the hold below is pure bucket pushes.
     for (r, g) in games.iter_mut().enumerate() {
-        g.pending = Some(EvalResult {
-            logits: Arc::clone(&logits),
-            row: r,
-            value: values[r],
-        });
+        g.pending = Some(EvalResult { logits: Arc::clone(&logits), row: r });
     }
     let mut q = shared.returns.lock().unwrap();
     for g in games {
@@ -516,6 +438,8 @@ fn requeue_scattered(
 // --- inference + scatter -----------------------------------------------------
 struct WorkItem {
     logits: Tensor, // GPU [m, 33]
+    // The value head is unused by search-free self-play; the tensor is carried
+    // only to keep it alive until the event sync (same stream as the logits).
     values: Tensor, // GPU [m]
     event: CudaEvent,
     games: Vec<Box<InFlight>>,
@@ -675,12 +599,9 @@ fn scatter_thread(shared: Arc<Shared>, work_rx: Receiver<WorkItem>) {
         item.event.sync();
         let m = item.games.len();
         let logits = item.logits.to_device(Device::Cpu).contiguous();
-        let values = item.values.to_device(Device::Cpu).contiguous();
         let mut lh = vec![0f32; m * POLICY_SIZE];
         logits.copy_data(&mut lh, m * POLICY_SIZE);
-        let mut vh = vec![0f32; m];
-        values.copy_data(&mut vh, m);
-        requeue_scattered(&shared, Arc::new(lh), &vh, item.games);
+        requeue_scattered(&shared, Arc::new(lh), item.games);
     }
 }
 
@@ -753,13 +674,14 @@ fn write_f32s<W: Write>(w: &mut W, s: &[f32]) -> io::Result<()> {
 }
 
 /// One finished game = one frame: u32 n_rows, then n_rows x (state[230] f32,
-/// pi[33] f32, z f32), little-endian. Flushed per game.
+/// legal_mask[33] f32, action f32, z f32), little-endian. Flushed per game.
 fn write_frame(out: &Mutex<BufWriter<io::Stdout>>, rows: &[Row]) {
     let mut w = out.lock().unwrap();
     let _ = w.write_all(&(rows.len() as u32).to_le_bytes());
-    for (state, pi, z) in rows {
+    for (state, mask, action, z) in rows {
         let _ = write_f32s(&mut *w, state);
-        let _ = write_f32s(&mut *w, pi);
+        let _ = write_f32s(&mut *w, mask);
+        let _ = w.write_all(&(*action as f32).to_le_bytes());
         let _ = w.write_all(&z.to_le_bytes());
     }
     let _ = w.flush();
@@ -792,13 +714,12 @@ pub fn run_serve(config: Config) {
 /// discard the first `warmup` and report a single cumulative average over the
 /// remaining measure window — that's the number to compare across batch sizes.
 pub fn run_bench(config: Config, run: Duration, interval: Duration, warmup: Duration) {
-    let sims = config.sims;
     let (nt, ns, nb) = (config.n_threads, config.n_slots, config.batch);
     let shared = make_shared(config);
     let sink: Arc<dyn Fn(Vec<Row>) + Send + Sync> = Arc::new(|_rows: Vec<Row>| {});
     let pipeline = spawn_pipeline(shared.clone(), sink);
 
-    println!("selfplay_rs bench: batch={nb} threads={nt} slots={ns} sims={sims} warmup={:.0}s", warmup.as_secs_f64());
+    println!("selfplay_rs bench: batch={nb} threads={nt} slots={ns} warmup={:.0}s", warmup.as_secs_f64());
     let start = Instant::now();
     let mut win_start = start;
     let (mut last_g, mut last_r) = (0u64, 0u64);
@@ -844,5 +765,64 @@ pub fn run_bench(config: Config, run: Duration, interval: Duration, warmup: Dura
             );
         }
         None => println!("STEADY batch={nb}: run shorter than warmup; no measurement"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive full games through the worker-side primitives with a dummy uniform
+    /// net (no GPU): every recorded action must be legal under its row's mask,
+    /// the mask must match the true state's legal moves at staging time, and z
+    /// must be ±1 partitioned by the winning seat.
+    #[test]
+    fn selfplay_rows_are_legal_and_consistent() {
+        for seed in 0..40u64 {
+            let mut g = new_game(seed);
+            let rows = loop {
+                match advance_until_eval_or_done(&mut g) {
+                    Advance::Eval => {
+                        assert_eq!(g.staged_enc.len(), ENC_LEN);
+                        assert_eq!(g.staged_mask, legal_mask(&g.state, g.mover));
+                        let res = EvalResult {
+                            logits: Arc::new(vec![0.0f32; POLICY_SIZE]),
+                            row: 0,
+                        };
+                        apply_result(&mut g, res);
+                    }
+                    Advance::Done(rows) => break rows,
+                }
+            };
+            assert!(!rows.is_empty(), "match produced no decisions (seed {seed})");
+            for (state, mask, action, z) in &rows {
+                assert_eq!(state.len(), ENC_LEN);
+                assert_eq!(mask[*action as usize], 1.0, "illegal action sampled (seed {seed})");
+                assert!(*z == 1.0 || *z == -1.0);
+            }
+            assert!(rows.iter().any(|r| r.3 == 1.0) && rows.iter().any(|r| r.3 == -1.0),
+                    "both seats decide in every match (seed {seed})");
+        }
+    }
+
+    #[test]
+    fn sample_masked_respects_mask_and_argmax_at_temp_zero() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut mask = [0.0f32; NUM_CARDS];
+        mask[3] = 1.0;
+        mask[10] = 1.0;
+        mask[20] = 1.0;
+        let mut logits = [0.0f32; NUM_CARDS];
+        logits[5] = 100.0; // illegal: huge logit must never be picked
+        logits[10] = 2.0;
+        let mut seen = [0u32; NUM_CARDS];
+        for _ in 0..300 {
+            let a = sample_masked(&logits, &mask, 1.0, &mut rng);
+            assert!(mask[a] > 0.0, "sampled an illegal slot");
+            seen[a] += 1;
+        }
+        assert!(seen[10] > seen[3] && seen[10] > seen[20], "higher logit should dominate");
+        assert!(seen[3] > 0 && seen[20] > 0, "temp 1.0 should still explore");
+        assert_eq!(sample_masked(&logits, &mask, 0.0, &mut rng), 10);
     }
 }

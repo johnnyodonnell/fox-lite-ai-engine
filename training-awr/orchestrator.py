@@ -1,16 +1,19 @@
-"""Continuous AlphaZero/ISMCTS self-play orchestrator.
+"""Continuous AWR self-play orchestrator (search-free).
 
 Runs the trainer (PyTorch, paced SGD) in this process and spawns ONE standalone
-Rust self-play worker (`selfplay_rs serve`) that holds the net on the GPU, runs
-ISMCTS self-play 100% in Rust, and streams finished games back over stdout as
-length-prefixed frames. The trainer drains those into a ring ReplayBuffer, runs
-SGD paced to the data rate (KataGo-style sample reuse), and republishes weights
+Rust self-play worker (`selfplay_rs serve`) that holds the net on the GPU,
+plays search-free self-play 100% in Rust (moves sampled straight from the
+policy head), and streams finished games back over stdout as length-prefixed
+frames of (state, legal_mask, action, z) rows. The trainer drains those into a
+ring ReplayBuffer, runs AWR SGD paced to the data rate (sample reuse —
+off-policy replay is part of AWR, not a compromise), and republishes weights
 to `serving_weights.safetensors`, which the worker hot-reloads on mtime change.
 
 Every `--snapshot-every` it snapshots (safetensors + ONNX) and launches a
-detached `evaluate_rs` (ISMCTS evaluation + Elo into pool.json). Resumes from
-`<out-dir>/latest.pt`; a fresh run can warm-start from `--init-from` (a `.pt`
-checkpoint or a raw `.safetensors` snapshot — e.g. the best run1 snapshot).
+detached `evaluate_rs` (Elo into pool.json; `--eval-sims 1` = raw-policy
+argmax, matching the deployed engine). Resumes from `<out-dir>/latest.pt`; a
+fresh run can warm-start from `--init-from` (a `.pt` checkpoint or a raw
+`.safetensors` snapshot).
 """
 
 import argparse
@@ -36,7 +39,7 @@ from train import ReplayBuffer, train_step
 HERE = Path(__file__).resolve().parent
 SELFPLAY_BIN = HERE / "selfplay_rs" / "target" / "release" / "selfplay_rs"
 EVAL_BIN = HERE / "selfplay_rs" / "target" / "release" / "evaluate_rs"
-ROW_FLOATS = INPUT_SIZE + NUM_CARDS + 1  # state[230] + pi[33] + z = 264
+ROW_FLOATS = INPUT_SIZE + NUM_CARDS + 2  # state[230] + mask[33] + action + z = 265
 
 
 def parse_duration(spec: str) -> float:
@@ -88,27 +91,34 @@ def _pid_alive(pid: int) -> bool:
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", default="runs/run3")
+    ap.add_argument("--out-dir", default="runs/run4")
     ap.add_argument("--init-from", default=None,
                     help="Warm-start a fresh run from a .pt checkpoint or a raw "
                          ".safetensors snapshot (weights only; fresh clock). Only "
                          "used on cold start (ignored once latest.pt exists).")
-    ap.add_argument("--snapshot-every", default="4h")
+    ap.add_argument("--snapshot-every", default="30m")
     ap.add_argument("--save-latest-every", default="300s")
     ap.add_argument("--publish-every", default="15s",
                     help="How often to republish serving_weights.safetensors "
                          "(the worker hot-reloads it on mtime change).")
-    # self-play worker (ISMCTS)
-    ap.add_argument("--sims", type=int, default=200)
-    ap.add_argument("--threads", type=int, default=19, help="MCTS worker threads")
+    # self-play worker (search-free)
+    ap.add_argument("--threads", type=int, default=19, help="self-play worker threads")
     ap.add_argument("--slots", type=int, default=4, help="GPU forwards in flight")
     ap.add_argument("--selfplay-batch", type=int, default=4096, help="GPU forward width")
     ap.add_argument("--queue-max", type=int, default=64)
-    # training (AlphaZero supervised: CE(pi) + MSE(z))
-    ap.add_argument("--buffer-capacity", type=int, default=2_000_000,
-                    help="Replay window in rows (~1KB each). Must span hours of "
-                         "self-play / many model versions for stable AlphaZero "
-                         "training; 200k was ~80s of data at live throughput.")
+    # training (AWR: exp-weighted policy regression + MSE(z))
+    ap.add_argument("--buffer-capacity", type=int, default=10_000_000,
+                    help="Replay window in rows (~1.1KB each, ~11GB at 10M). AWR "
+                         "is off-policy by design: a window spanning many model "
+                         "versions is the algorithm, not a staleness compromise.")
+    ap.add_argument("--beta", type=float, default=1.0,
+                    help="AWR temperature: w = exp((z - V)/beta). z is ±1 so "
+                         "advantages live in (-2, 2); 0.5-1.0 is the sane range.")
+    ap.add_argument("--w-max", type=float, default=20.0,
+                    help="AWR weight clip (paper default).")
+    ap.add_argument("--entropy-coef", type=float, default=0.0,
+                    help="Entropy bonus. 0 = faithful AWR; set ~0.01 (the old "
+                         "REINFORCE value) if logged entropy collapses.")
     ap.add_argument("--min-buffer-for-train", type=int, default=2_000)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--target-reuse", type=float, default=4.0,
@@ -119,15 +129,14 @@ def parse_args():
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log-every", type=float, default=30.0)
-    # evaluation (ISMCTS)
+    # evaluation
     ap.add_argument("--no-eval", action="store_true")
     ap.add_argument("--no-aoti", action="store_true",
                     help="disable the fused AOTInductor self-play forward (use eager bf16)")
     ap.add_argument("--eval-games", type=int, default=200, help="matches per opponent")
-    ap.add_argument("--eval-sims", type=int, default=200,
-                    help="ISMCTS eval is synchronous (batch-1); at a full opponent "
-                         "pool an eval can outlast the snapshot interval, in which "
-                         "case the eval.lock skips the overlapping snapshot's eval")
+    ap.add_argument("--eval-sims", type=int, default=1,
+                    help="evaluate_rs ISMCTS sims; 1 degenerates to raw-policy "
+                         "argmax — the deployed (search-free) engine's behavior")
     ap.add_argument("--n-top", type=int, default=2)
     ap.add_argument("--n-anchors", type=int, default=3)
     return ap.parse_args()
@@ -165,6 +174,13 @@ def main():
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     buf = ReplayBuffer(args.buffer_capacity)
     rng = np.random.default_rng(args.seed)
+
+    def ingest(flat):
+        """Column-slice a finished-game frame (n_rows, 265) into the buffer."""
+        buf.add_block(flat[:, :INPUT_SIZE],
+                      flat[:, INPUT_SIZE:INPUT_SIZE + NUM_CARDS],
+                      flat[:, ROW_FLOATS - 2].astype(np.int64),
+                      flat[:, ROW_FLOATS - 1])
 
     # ----- Resume from latest.pt, else warm-start from --init-from, else cold -----
     base_elapsed = 0.0
@@ -242,8 +258,9 @@ def main():
     def launch_eval(st_path):
         if args.no_eval or not EVAL_BIN.exists():
             return
-        # Skip if a prior eval is still running (ISMCTS eval can outlast a short
-        # snapshot interval; piling up evals would thrash the GPU vs self-play).
+        # Skip if a prior eval is still running (at sims=1 an eval is fast, but
+        # a full opponent pool can still outlast a short snapshot interval;
+        # piling up evals would thrash the GPU vs self-play).
         lock = out_dir / "eval.lock"
         if lock.exists():
             try:
@@ -289,13 +306,13 @@ def main():
             payload = read_exact(stdout, n_rows * ROW_FLOATS * 4)
             if payload is None:
                 return
+            # Keep the frame as ONE (n_rows, 265) array; the drain loop
+            # column-slices it straight into the ring buffer (per-row Python
+            # tuples can't keep up with search-free generation rates).
             flat = np.frombuffer(payload, dtype="<f4").reshape(n_rows, ROW_FLOATS)
-            rows = [(r[:INPUT_SIZE].copy(),
-                     r[INPUT_SIZE:INPUT_SIZE + NUM_CARDS].copy(),
-                     float(r[-1])) for r in flat]
             while not stop.is_set():
                 try:
-                    out_queue.put((rows, 1), timeout=0.5)
+                    out_queue.put((flat, 1), timeout=0.5)
                     break
                 except pyqueue.Full:
                     pass
@@ -307,7 +324,6 @@ def main():
         cmd = [str(SELFPLAY_BIN), "serve",
                "--weights", str(serving_st),
                "--threads", str(args.threads),
-               "--sims", str(args.sims),
                "--slots", str(args.slots),
                "--batch", str(args.selfplay_batch),
                "--seed", str(args.seed + 1000)]
@@ -320,7 +336,7 @@ def main():
         t.start()
         fwd = "AOTI" if serving_model is not None else "eager-bf16"
         print(f"spawned selfplay_rs worker pid={proc.pid} ({fwd}; "
-              f"threads={args.threads} sims={args.sims} batch={args.selfplay_batch})", flush=True)
+              f"threads={args.threads} batch={args.selfplay_batch})", flush=True)
         return proc
 
     selfplay_proc = start_selfplay()
@@ -353,19 +369,19 @@ def main():
             got_any = False
             for _ in range(args.queue_max):
                 try:
-                    rows, n_games = out_queue.get_nowait()
+                    flat, n_games = out_queue.get_nowait()
                 except pyqueue.Empty:
                     break
-                buf.add_many(rows)
+                ingest(flat)
                 total_games += n_games
-                gen_samples += len(rows)
+                gen_samples += len(flat)
                 got_any = True
             if len(buf) < args.min_buffer_for_train and not got_any:
                 try:
-                    rows, n_games = out_queue.get(timeout=1.0)
-                    buf.add_many(rows)
+                    flat, n_games = out_queue.get(timeout=1.0)
+                    ingest(flat)
                     total_games += n_games
-                    gen_samples += len(rows)
+                    gen_samples += len(flat)
                 except pyqueue.Empty:
                     pass
 
@@ -376,7 +392,9 @@ def main():
             n_steps = max(0, min(allowed, args.max_steps_per_cycle))
             if len(buf) >= args.min_buffer_for_train and n_steps > 0:
                 t0 = time.time()
-                losses = [train_step(net, opt, buf.sample(args.batch_size, rng=rng), device)
+                losses = [train_step(net, opt, buf.sample(args.batch_size, rng=rng), device,
+                                     beta=args.beta, w_max=args.w_max,
+                                     entropy_coef=args.entropy_coef)
                           for _ in range(n_steps)]
                 cycle_tr_time = time.time() - t0
                 total_train_steps += n_steps
@@ -385,7 +403,8 @@ def main():
                     "loss": round(float(np.mean([l["loss"] for l in losses])), 4),
                     "policy": round(float(np.mean([l["policy_loss"] for l in losses])), 4),
                     "value": round(float(np.mean([l["value_loss"] for l in losses])), 4),
-                    "entropy": round(float(np.mean([l["target_entropy"] for l in losses])), 4),
+                    "entropy": round(float(np.mean([l["entropy"] for l in losses])), 4),
+                    "w_mean": round(float(np.mean([l["w_mean"] for l in losses])), 3),
                 }
             elif not got_any:
                 time.sleep(0.05)

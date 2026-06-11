@@ -8,7 +8,7 @@
 # Usage: aoti_slot_batch_sweep.sh "<batches>" "<slots>" [warmup] [measure]
 set -euo pipefail
 
-DIR=/home/johnny/Workspace/fox-lite/fox-lite-ai-engine/training
+DIR=/home/johnny/Workspace/fox-lite/fox-lite-ai-engine/training-awr
 cd "$DIR"
 source .venv/bin/activate
 
@@ -18,7 +18,6 @@ export LD_LIBRARY_PATH="$(python -c 'import os,glob,torch; tl=os.path.join(os.pa
 BIN="$DIR/selfplay_rs/target/release/selfplay_rs"
 WEIGHTS="${WEIGHTS:-/home/johnny/Workspace/fox-lite/runs/run3/serving_weights.safetensors}"
 THREADS="${THREADS:-16}"
-SIMS="${SIMS:-200}"
 WARMUP="${3:-60}"
 MEASURE="${4:-90}"
 INTERVAL="${INTERVAL:-30}"
@@ -27,7 +26,7 @@ RUN_SECS=$(( WARMUP + MEASURE ))
 BATCHES="${1:-1024 2048 4096}"
 SLOTS_LIST="${2:-4 8 16}"
 
-echo "=== AOTI slot/batch sweep  weights=$WEIGHTS threads=$THREADS sims=$SIMS warmup=${WARMUP}s measure=${MEASURE}s ==="
+echo "=== AOTI slot/batch sweep  weights=$WEIGHTS threads=$THREADS warmup=${WARMUP}s measure=${MEASURE}s ==="
 for B in $BATCHES; do
   PT2="/tmp/sm_${B}.pt2"
   if [[ ! -f "$PT2" ]]; then
@@ -37,7 +36,7 @@ for B in $BATCHES; do
   for S in $SLOTS_LIST; do
     echo "########## batch=$B slots=$S ##########"
     "$BIN" bench --weights "$WEIGHTS" --model "$PT2" \
-      --threads "$THREADS" --slots "$S" --sims "$SIMS" --batch "$B" --seed 1042 \
+      --threads "$THREADS" --slots "$S" --batch "$B" --seed 1042 \
       --run-secs "$RUN_SECS" --interval-secs "$INTERVAL" --warmup-secs "$WARMUP"
     echo
   done

@@ -15,7 +15,6 @@ BIN="$DIR/selfplay_rs/target/release/selfplay_rs"
 WEIGHTS="${WEIGHTS:-/home/johnny/Workspace/fox-lite/runs/run3/serving_weights.safetensors}"
 THREADS="${THREADS:-16}"
 SLOTS="${SLOTS:-2}"
-SIMS="${SIMS:-200}"
 WARMUP="${WARMUP:-90}"
 MEASURE="${MEASURE:-150}"
 RUN_SECS=$(( WARMUP + MEASURE ))
@@ -24,7 +23,7 @@ INTERVAL="${INTERVAL:-15}"
 for B in $1; do
   echo "########## batch=$B ##########"
   "$BIN" bench --weights "$WEIGHTS" --threads "$THREADS" --slots "$SLOTS" \
-    --sims "$SIMS" --batch "$B" --seed 1042 \
+    --batch "$B" --seed 1042 \
     --run-secs "$RUN_SECS" --interval-secs "$INTERVAL" --warmup-secs "$WARMUP"
   echo
 done

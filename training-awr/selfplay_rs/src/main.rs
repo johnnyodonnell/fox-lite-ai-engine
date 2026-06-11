@@ -26,8 +26,6 @@ fn flag(args: &[String], key: &str, default: &str) -> String {
 /// Shared CLI parsing for the `serve` and `bench` self-play subcommands.
 fn parse_pipeline_config(args: &[String]) -> pipeline::Config {
     pipeline::Config {
-        sims: flag(args, "--sims", "400").parse().unwrap(),
-        add_root_noise: !args.iter().any(|a| a == "--no-noise"),
         seed: flag(args, "--seed", "0").parse().unwrap(),
         n_threads: flag(args, "--threads", "16").parse().unwrap(),
         n_slots: flag(args, "--slots", "2").parse().unwrap(),
@@ -206,8 +204,8 @@ fn main() {
             std::process::exit(if ok { 0 } else { 1 });
         }
         "serve" => {
-            // Continuous ISMCTS self-play worker: streams finished games as framed
-            // bytes on stdout for the orchestrator; shuts down on stdin EOF.
+            // Continuous search-free self-play worker: streams finished games as
+            // framed bytes on stdout for the orchestrator; shuts down on stdin EOF.
             pipeline::run_serve(parse_pipeline_config(&args));
         }
         "bench" => {
