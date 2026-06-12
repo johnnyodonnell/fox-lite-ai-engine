@@ -8,8 +8,10 @@ Then copy --out to the web app's public/models/current.onnx and commit.
 
 import argparse
 
-from export import export_onnx, load_weights_st
-from net import FoxNet
+from safetensors.torch import load_file
+
+from export import export_onnx
+from net import foxnet_for_state
 
 
 def main():
@@ -18,8 +20,7 @@ def main():
     ap.add_argument("--out", required=True, help="output .onnx (self-contained)")
     args = ap.parse_args()
 
-    net = FoxNet()
-    load_weights_st(net, args.snapshot)
+    net = foxnet_for_state(load_file(args.snapshot))
     export_onnx(net, args.out)
     print(f"exported {args.out}")
 

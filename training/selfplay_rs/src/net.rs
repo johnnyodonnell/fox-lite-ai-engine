@@ -1,5 +1,6 @@
 //! Fox-Lite net v3 (training/net.py) in tch-rs: transformer history encoder
-//! over trick tokens + learned-query attention readout + residual MLP trunk.
+//! over trick tokens + pooled summary (masked mean + masked per-dim max +
+//! learned-query attention readout) + residual MLP trunk.
 //!
 //! Weights are loaded from fp32 safetensors keyed by state_dict FQN
 //! (hist_lead_embed, hist_follow_embed, hist_led_embed, hist_pos,
@@ -7,8 +8,10 @@
 //! blocks.{i}.{ln1,fc1,ln2,fc2}, policy_ln/policy_fc,
 //! value_ln/value_fc1/value_fc2). `forward` matches PyTorch's FoxNet exactly
 //! (LayerNorm eps 1e-5, exact-erf GELU, additive (valid-1)*1e9 key mask,
-//! any-valid-gated attention readout, tanh value head). `reload` copies fresh
-//! weights in place for cheap hot-swap between cohorts.
+//! any-valid-gated pooling, tanh value head). The mean+max blocks add no
+//! parameters, so the pooling flavor (readout-only run5 nets vs mean+max) is
+//! detected from the stem input width. `reload` copies fresh weights in place
+//! for cheap hot-swap between cohorts.
 
 use std::collections::HashMap;
 
@@ -30,6 +33,7 @@ pub struct Net {
     n_blocks: usize,
     n_hist_layers: usize,
     n_readout: i64,
+    mean_max: bool,
     width: i64,
     d_model: i64,
     p: HashMap<String, Tensor>,
@@ -63,15 +67,32 @@ impl Net {
         let d_model = p.get("hist_lead_embed.weight").unwrap().size()[1];
         let n_readout = p.get("readout_q").unwrap().size()[0];
         assert_eq!(d_model % N_HEADS, 0, "d_model {d_model} not divisible by {N_HEADS} heads");
+        // mean+max pooling adds no parameters; the stem input width is the
+        // only witness distinguishing it from the readout-only flavor (run5).
+        let stem_in = p.get("stem.weight").unwrap().size()[1];
+        let mean_max = stem_in == STATIC_SIZE as i64 + (n_readout + 2) * d_model;
+        assert!(
+            mean_max || stem_in == STATIC_SIZE as i64 + n_readout * d_model,
+            "{path}: stem width {stem_in} matches neither pooling flavor"
+        );
         Net {
             dev,
             kind,
             n_blocks,
             n_hist_layers,
             n_readout,
+            mean_max,
             width,
             d_model,
             p,
+        }
+    }
+
+    pub fn flavor(&self) -> &'static str {
+        if self.mean_max {
+            "v3+mm"
+        } else {
+            "v3"
         }
     }
 
@@ -156,12 +177,20 @@ impl Net {
             h.matmul(&self.g("readout_q").transpose(0, 1)) / (self.d_model as f64).sqrt();
         let scores = scores + ((&valid - 1.0) * MASK_NEG).unsqueeze(-1);
         let att = scores.softmax(1, self.kind);
-        let pooled = att
+        let mut pooled = att
             .transpose(1, 2)
             .matmul(&h)
             .reshape([b, self.n_readout * self.d_model]);
-        // Empty history: softmax over all-masked slots is uniform over padding,
-        // so gate the readout to an exact zero vector when no token is valid.
+        if self.mean_max {
+            let vm = valid.unsqueeze(-1); // [B,T,1]
+            let mean = (&h * &vm).sum_dim_intlist([1].as_slice(), false, self.kind)
+                / vm.sum_dim_intlist([1].as_slice(), false, self.kind).clamp_min(1.0);
+            let mx = (&h + (&vm - 1.0) * MASK_NEG).amax([1].as_slice(), false);
+            pooled = Tensor::cat(&[mean, mx, pooled], 1);
+        }
+        // Empty history: softmax over all-masked slots is uniform over padding
+        // (and the masked max bottoms out at -MASK_NEG), so gate the summary to
+        // an exact zero vector when no token is valid.
         let pooled = pooled * valid.amax([1].as_slice(), true);
 
         let mut h = self.linear(&Tensor::cat(&[statik, pooled], 1), "stem");

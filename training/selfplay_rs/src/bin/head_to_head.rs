@@ -37,10 +37,10 @@ struct NetAgent {
 
 impl NetAgent {
     fn arch(&self) -> &'static str {
-        match self.net {
+        match &self.net {
             AnyNet::V1(_) => "v1",
             AnyNet::V2(_) => "v2",
-            AnyNet::V3(_) => "v3",
+            AnyNet::V3(n) => n.flavor(),
         }
     }
 

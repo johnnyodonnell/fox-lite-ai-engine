@@ -11,14 +11,17 @@ History encoder: token = lead-card embedding + follow-card embedding +
 led-by-self embedding + learned positional embedding; N pre-LN self-attention
 blocks (explicit q/k/v/o Linears — no nn.MultiheadAttention, so the
 safetensors keys stay simple FQNs the Rust forward can mirror); additive key
-mask (valid-1)*1e9; final LayerNorm; then an attention READOUT instead of a
-mean-pool: N_READOUT learned query vectors softmax-attend over the tokens and
-their pooled outputs are concatenated. No key/value projections: with learned
-constant queries a key projection is absorbed into the query, and a value
-projection into the stem. An empty history (no completed tricks yet) pools to
-a zero vector by construction (the readout is gated on any-valid). The pooled
-vectors are concatenated with the static block and fed to the same residual
-MLP trunk as v1/v2.
+mask (valid-1)*1e9; final LayerNorm; then a pooled summary instead of a bare
+mean-pool: masked MEAN (counting) + masked per-dim MAX (ever-happened facts)
++ N_READOUT learned query vectors that softmax-attend over the tokens, all
+concatenated. No key/value projections: with learned constant queries a key
+projection is absorbed into the query, and a value projection into the stem.
+An empty history (no completed tricks yet) pools to a zero vector by
+construction (the summary is gated on any-valid). The pooled vectors are
+concatenated with the static block and fed to the same residual MLP trunk as
+v1/v2. mean_max_pool=False reproduces the readout-only flavor (run5); the
+mean+max blocks add no parameters, so the stem width is the only witness —
+use foxnet_for_state to rebuild the right flavor from a state dict.
 
 State-dict key names are chosen to be loaded directly by the Rust tch forward
 (selfplay_rs/src/net.rs): hist_lead_embed, hist_follow_embed, hist_led_embed,
@@ -95,8 +98,10 @@ class ResBlock(nn.Module):
 
 class FoxNet(nn.Module):
     def __init__(self, width=WIDTH, n_blocks=N_BLOCKS, policy_size=POLICY_SIZE,
-                 d_model=D_MODEL, n_layers=N_LAYERS, n_readout=N_READOUT):
+                 d_model=D_MODEL, n_layers=N_LAYERS, n_readout=N_READOUT,
+                 mean_max_pool=True):
         super().__init__()
+        self.mean_max_pool = mean_max_pool
         self.hist_lead_embed = nn.Embedding(NUM_CARDS, d_model)
         self.hist_follow_embed = nn.Embedding(NUM_CARDS, d_model)
         self.hist_led_embed = nn.Embedding(2, d_model)
@@ -104,7 +109,8 @@ class FoxNet(nn.Module):
         self.hist_layers = nn.ModuleList([HistLayer(d_model) for _ in range(n_layers)])
         self.hist_ln = nn.LayerNorm(d_model)
         self.readout_q = nn.Parameter(torch.randn(n_readout, d_model) * 0.02)
-        self.stem = nn.Linear(STATIC_SIZE + n_readout * d_model, width)
+        pool_d = (n_readout + (2 if mean_max_pool else 0)) * d_model
+        self.stem = nn.Linear(STATIC_SIZE + pool_d, width)
         self.blocks = nn.ModuleList([ResBlock(width) for _ in range(n_blocks)])
         self.policy_ln = nn.LayerNorm(width)
         self.policy_fc = nn.Linear(width, policy_size)
@@ -133,8 +139,14 @@ class FoxNet(nn.Module):
         scores = scores + ((valid - 1.0) * MASK_NEG).unsqueeze(-1)
         att = F.softmax(scores, dim=1)
         pooled = att.transpose(1, 2).matmul(h).flatten(1)  # [B, Q*d]
-        # Empty history: softmax over all-masked slots is uniform over padding,
-        # so gate the readout to an exact zero vector when no token is valid.
+        if self.mean_max_pool:
+            vm = valid.unsqueeze(-1)  # [B,T,1]
+            mean = (h * vm).sum(dim=1) / vm.sum(dim=1).clamp(min=1.0)
+            mx = (h + (vm - 1.0) * MASK_NEG).amax(dim=1)
+            pooled = torch.cat([mean, mx, pooled], dim=1)
+        # Empty history: softmax over all-masked slots is uniform over padding
+        # (and the masked max bottoms out at -MASK_NEG), so gate the summary to
+        # an exact zero vector when no token is valid.
         pooled = pooled * valid.amax(dim=1, keepdim=True)
 
         t = self.stem(torch.cat([static, pooled], dim=1))
@@ -144,6 +156,24 @@ class FoxNet(nn.Module):
         v = F.gelu(self.value_fc1(self.value_ln(t)))
         v = torch.tanh(self.value_fc2(v)).squeeze(-1)
         return policy, v
+
+
+def foxnet_for_state(sd) -> FoxNet:
+    """Build a FoxNet matching a state dict's pooling flavor and load it.
+
+    mean+max pooling adds no parameters, so the stem input width is the only
+    way to tell the flavors apart. Used by resume/promote so checkpoints from
+    readout-only runs (run5) and mean+max runs both load under current code.
+    """
+    d_model = sd["hist_lead_embed.weight"].shape[1]
+    n_readout = sd["readout_q"].shape[0]
+    stem_in = sd["stem.weight"].shape[1]
+    mean_max = stem_in == STATIC_SIZE + (n_readout + 2) * d_model
+    if not mean_max and stem_in != STATIC_SIZE + n_readout * d_model:
+        raise ValueError(f"stem width {stem_in} matches neither pooling flavor")
+    net = FoxNet(n_readout=n_readout, mean_max_pool=mean_max)
+    net.load_state_dict(sd)
+    return net
 
 
 def n_params(net) -> int:
