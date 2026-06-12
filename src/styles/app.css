@@ -48,7 +48,7 @@ h1 {
   flex-direction: column;
   align-items: center;
   gap: 0.4rem;
-  min-height: 4rem;
+  min-height: 1rem;
 }
 
 .status__message {
@@ -221,8 +221,9 @@ h1 {
 
 .trick {
   display: flex;
-  align-items: flex-end;
-  gap: 1rem;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .trick__slot {
@@ -237,13 +238,6 @@ h1 {
 
 .trick__slot--winner {
   background: var(--highlight);
-}
-
-.trick__label {
-  font-size: 0.75rem;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
 }
 
 /* trump */
