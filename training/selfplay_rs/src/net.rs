@@ -172,3 +172,110 @@ impl Net {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// v1 net (pre-history residual MLP, input 230) — kept so legacy snapshots
+// (run1-run3) can play against current nets. Restored from pre-5f0a8aa net.rs.
+// ---------------------------------------------------------------------------
+pub struct NetV1 {
+    dev: Device,
+    n_blocks: usize,
+    width: i64,
+    p: HashMap<String, Tensor>,
+}
+
+impl NetV1 {
+    pub fn load(path: &str, dev: Device, kind: Kind) -> NetV1 {
+        let p = load_map(path, dev, kind);
+        assert!(
+            !p.contains_key("hist_embed.weight"),
+            "{path}: has hist_embed.weight — this is a v2 net, use Net::load"
+        );
+        let n_blocks = (0..)
+            .take_while(|i| p.contains_key(&format!("blocks.{i}.fc1.weight")))
+            .count();
+        let width = p
+            .get("stem.weight")
+            .unwrap_or_else(|| panic!("missing stem.weight"))
+            .size()[0];
+        NetV1 { dev, n_blocks, width, p }
+    }
+
+    pub fn device(&self) -> Device {
+        self.dev
+    }
+
+    fn g(&self, k: &str) -> &Tensor {
+        self.p.get(k).unwrap_or_else(|| panic!("missing param {k}"))
+    }
+
+    fn linear(&self, x: &Tensor, pfx: &str) -> Tensor {
+        x.linear(
+            self.g(&format!("{pfx}.weight")),
+            Some(self.g(&format!("{pfx}.bias"))),
+        )
+    }
+
+    fn ln(&self, x: &Tensor, pfx: &str) -> Tensor {
+        x.layer_norm(
+            [self.width],
+            Some(self.g(&format!("{pfx}.weight"))),
+            Some(self.g(&format!("{pfx}.bias"))),
+            LN_EPS,
+            true,
+        )
+    }
+
+    /// (policy_logits [B,33], value [B]) — matches v1 FoxNet.forward.
+    pub fn forward(&self, x: &Tensor) -> (Tensor, Tensor) {
+        let mut h = self.linear(x, "stem");
+        for i in 0..self.n_blocks {
+            let inp = h.shallow_clone();
+            let a = self.ln(&inp, &format!("blocks.{i}.ln1")).gelu("none");
+            let a = self.linear(&a, &format!("blocks.{i}.fc1"));
+            let b = self.ln(&a, &format!("blocks.{i}.ln2")).gelu("none");
+            let b = self.linear(&b, &format!("blocks.{i}.fc2"));
+            h = inp + b;
+        }
+        let policy = self.linear(&self.ln(&h, "policy_ln"), "policy_fc");
+        let v = self.ln(&h, "value_ln");
+        let v = self.linear(&v, "value_fc1").gelu("none");
+        let v = self.linear(&v, "value_fc2").tanh().squeeze_dim(-1);
+        (policy, v)
+    }
+}
+
+/// A net of either arch, detected from the checkpoint's keys. Each variant
+/// expects its own encoding (v1: `encode_v1`/230, v2: `encode`/205).
+pub enum AnyNet {
+    V1(NetV1),
+    V2(Net),
+}
+
+impl AnyNet {
+    pub fn load_auto(path: &str, dev: Device, kind: Kind) -> AnyNet {
+        let has_hist = Tensor::read_safetensors(path)
+            .unwrap_or_else(|e| panic!("read_safetensors {path}: {e}"))
+            .iter()
+            .any(|(k, _)| k == "hist_embed.weight");
+        if has_hist {
+            AnyNet::V2(Net::load(path, dev, kind))
+        } else {
+            AnyNet::V1(NetV1::load(path, dev, kind))
+        }
+    }
+
+    pub fn device(&self) -> Device {
+        match self {
+            AnyNet::V1(n) => n.device(),
+            AnyNet::V2(n) => n.device(),
+        }
+    }
+
+    pub fn forward(&self, x: &Tensor) -> (Tensor, Tensor) {
+        match self {
+            AnyNet::V1(n) => n.forward(x),
+            AnyNet::V2(n) => n.forward(x),
+        }
+    }
+}

@@ -132,6 +132,119 @@ pub fn encode(state: &State, mover: Player) -> Vec<f32> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// v1 encoding (pre-history, INPUT_SIZE 230) — kept so legacy snapshots
+// (run1-run3) can be evaluated against current nets. Restored verbatim from
+// the pre-5f0a8aa layout: played/voids/LED one-hot blocks, no history tokens.
+// ---------------------------------------------------------------------------
+const PLAYED_SELF: usize = NUM_CARDS; // 33
+const PLAYED_OPP: usize = NUM_CARDS; // 33
+const OPP_VOIDS: usize = NUM_SUITS; // 3
+const LED: usize = NUM_CARDS + 1; // 34
+
+pub const INPUT_SIZE_V1: usize = OWN_HAND
+    + PLAYED_SELF
+    + PLAYED_OPP
+    + TRUMP_RANK
+    + OPP_VOIDS
+    + LED
+    + SELF_TRICKS
+    + OPP_TRICKS
+    + TRICK_NUM
+    + SCORE_SLOTS
+    + SCORE_SLOTS; // 230
+
+/// Opponent (the seat that is NOT `mover`) void suits inferred from history.
+fn opponent_voids(state: &State, opponent: Player) -> [bool; NUM_SUITS] {
+    let mut voids = [false; NUM_SUITS];
+    let hist = &state.trick_history;
+    let mut i = 0;
+    // Events are appended in play order; each trick is a (lead, follow) pair,
+    // but a trick may be incomplete at the tail (single lead event).
+    while i < hist.len() {
+        // gather events sharing this trick number
+        let trick = hist[i].trick;
+        let lead = hist[i];
+        let mut j = i + 1;
+        while j < hist.len() && hist[j].trick == trick {
+            j += 1;
+        }
+        if j - i >= 2 {
+            let follow = hist[i + 1];
+            if follow.player == opponent && follow.card.suit != lead.card.suit {
+                voids[lead.card.suit as usize] = true;
+            }
+        }
+        i = j;
+    }
+    voids
+}
+
+/// v1 encode of `state` from `mover`'s perspective: length `INPUT_SIZE_V1`.
+pub fn encode_v1(state: &State, mover: Player) -> Vec<f32> {
+    let mut out = vec![0.0f32; INPUT_SIZE_V1];
+    let trump = state.trump.suit;
+    let opp = mover.other();
+
+    let own_hand = state.hand(mover);
+    let self_tricks = state.tricks_won[mover.idx()] as usize;
+    let opp_tricks = state.tricks_won[opp.idx()] as usize;
+    let self_score = state.score[mover.idx()] as usize;
+    let opp_score = state.score[opp.idx()] as usize;
+
+    let mut cur = 0;
+    // own hand
+    for c in own_hand {
+        out[cur + canon_card_index(*c, trump)] = 1.0;
+    }
+    cur += OWN_HAND;
+    // played by self / opp
+    let played_self_base = cur;
+    let played_opp_base = cur + PLAYED_SELF;
+    for ev in &state.trick_history {
+        let base = if ev.player == mover {
+            played_self_base
+        } else {
+            played_opp_base
+        };
+        out[base + canon_card_index(ev.card, trump)] = 1.0;
+    }
+    cur += PLAYED_SELF + PLAYED_OPP;
+    // trump rank (suit implied = canonical slot 0)
+    out[cur + (state.trump.rank as usize - 1)] = 1.0;
+    cur += TRUMP_RANK;
+    // opponent voids
+    let voids = opponent_voids(state, opp);
+    for (real_suit, &is_void) in voids.iter().enumerate() {
+        if is_void {
+            out[cur + canon_suit(real_suit as u8, trump)] = 1.0;
+        }
+    }
+    cur += OPP_VOIDS;
+    // led card + "no led / I'm leading" flag
+    match state.led_card {
+        Some(led) => out[cur + canon_card_index(led, trump)] = 1.0,
+        None => out[cur + NUM_CARDS] = 1.0,
+    }
+    cur += LED;
+    // tricks won
+    out[cur + self_tricks.min(TRICKS_PER_ROUND as usize)] = 1.0;
+    cur += SELF_TRICKS;
+    out[cur + opp_tricks.min(TRICKS_PER_ROUND as usize)] = 1.0;
+    cur += OPP_TRICKS;
+    // trick number (1..13)
+    out[cur + (state.trick_num as usize - 1)] = 1.0;
+    cur += TRICK_NUM;
+    // match scores (one-hot 0..20, clamped)
+    out[cur + self_score.min(SCORE_SLOTS - 1)] = 1.0;
+    cur += SCORE_SLOTS;
+    out[cur + opp_score.min(SCORE_SLOTS - 1)] = 1.0;
+    cur += SCORE_SLOTS;
+
+    debug_assert_eq!(cur, INPUT_SIZE_V1);
+    out
+}
+
 /// Canonical legal-move mask (length `NUM_CARDS`) for `mover`.
 pub fn legal_mask(state: &State, mover: Player) -> [f32; NUM_CARDS] {
     let mut out = [0.0f32; NUM_CARDS];
