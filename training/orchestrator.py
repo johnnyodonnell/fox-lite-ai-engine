@@ -25,7 +25,7 @@ import torch
 
 from cohort import read_cohort
 from export import export_onnx, save_weights_st
-from net import FoxNet, N_BLOCKS, WIDTH, foxnet_for_state, n_params
+from net import FoxNet, N_BLOCKS, WIDTH, n_params
 from train import train_on_cohort
 
 HERE = Path(__file__).resolve().parent
@@ -141,13 +141,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}", flush=True)
 
-    latest = out_dir / "latest.pt"
-    ckpt = None
-    if latest.exists():
-        ckpt = torch.load(latest, map_location=device, weights_only=False)
-    # Resume rebuilds the exact pooling flavor the checkpoint was trained with
-    # (foxnet_for_state); a cold start uses the current default arch.
-    net = (foxnet_for_state(ckpt["weights"]) if ckpt is not None else FoxNet()).to(device)
+    net = FoxNet().to(device)
     # Train through a compiled wrapper (shares parameters with `net`); keep the
     # raw module for state_dict/safetensors/ONNX so the key names stay the plain
     # FQNs the Rust forward loads (no `_orig_mod.` prefix).
@@ -157,7 +151,10 @@ def main():
 
     base_elapsed, total_cohorts, total_games, total_steps = 0.0, 0, 0, 0
     next_snapshot_at = snapshot_interval
-    if ckpt is not None:
+    latest = out_dir / "latest.pt"
+    if latest.exists():
+        ckpt = torch.load(latest, map_location=device, weights_only=False)
+        net.load_state_dict(ckpt["weights"])
         opt.load_state_dict(ckpt["opt"])
         base_elapsed = ckpt.get("elapsed_sec", 0.0)
         total_cohorts = ckpt.get("cohorts", 0)
