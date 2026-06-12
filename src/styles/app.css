@@ -211,9 +211,15 @@ h1 {
 
 .trick {
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.5rem;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+/* Stagger the played cards: the player's card (second slot) sits lower,
+   so the cards' top halves overlap vertically while keeping a horizontal
+   gap between them. */
+.trick__slot + .trick__slot {
+  margin-top: 32px;
 }
 
 .trick__slot {

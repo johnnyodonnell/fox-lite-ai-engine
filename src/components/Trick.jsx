@@ -1,9 +1,9 @@
 import Card from './Card.jsx'
 
-// Renders the two slots of the current trick, stacked vertically: the bot's
-// card always on top (near its hand), the player's always on the bottom.
-// Empty slots are placeholders. When `winnerSide` is set ('lead' or
-// 'follow'), that card is highlighted.
+// Renders the two slots of the current trick, staggered: the bot's card
+// always on the left and raised, the player's always on the right and
+// lowered. Empty slots are placeholders. When `winnerSide` is set ('lead'
+// or 'follow'), that card is highlighted.
 export default function Trick({ leadCard, followCard, leader, winnerSide }) {
   const botSide = leader === 'human' ? 'follow' : 'lead'
   const humanSide = leader === 'human' ? 'lead' : 'follow'
