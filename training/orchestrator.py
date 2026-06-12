@@ -142,6 +142,10 @@ def main():
     print(f"device={device}", flush=True)
 
     net = FoxNet().to(device)
+    # Train through a compiled wrapper (shares parameters with `net`); keep the
+    # raw module for state_dict/safetensors/ONNX so the key names stay the plain
+    # FQNs the Rust forward loads (no `_orig_mod.` prefix).
+    net_train = torch.compile(net)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     rng = np.random.default_rng(args.seed)
 
@@ -253,7 +257,7 @@ def main():
         cohort = read_cohort(str(cohort_path))
         t1 = time.time()
         stats = train_on_cohort(
-            net, opt, cohort, device,
+            net_train, opt, cohort, device,
             sgd_batch=args.sgd_batch, epochs=args.epochs,
             c_value=args.c_value, c_entropy=args.c_entropy, rng=rng,
         )
