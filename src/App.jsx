@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import BotHand from './components/BotHand.jsx'
 import Hand from './components/Hand.jsx'
 import RoundBanner from './components/RoundBanner.jsx'
-import Status from './components/Status.jsx'
 import Trick from './components/Trick.jsx'
 import Trump from './components/Trump.jsx'
 import { bestMove, preload } from './engine/neural.js'
@@ -101,15 +100,14 @@ export default function App() {
     <main className="app">
       <h1>Fox Lite</h1>
 
-      <Status
-        humanScore={state.score.human}
-        botScore={state.score.bot}
-      />
-
       <BotHand count={state.botHand.length} />
 
       <div className="table-area">
         <Trump card={state.trump} />
+        <div className="score score--bot">Bot's score: {state.score.bot}</div>
+        <div className="score score--human">
+          Player's score: {state.score.human}
+        </div>
         <div className="table">
           <div className="table__tricks table__tricks--top">
             Bot tricks: {state.tricksWon.bot}
