@@ -20,19 +20,6 @@ import {
 
 const TRICK_PAUSE_MS = 1000
 
-function statusMessage(state) {
-  if (state.phase === 'trick-complete') {
-    const winner = state.lastTrick.winner === HUMAN ? 'You take' : 'Bot takes'
-    return `${winner} the trick`
-  }
-  if (state.phase === 'round-over') return 'Round complete'
-  if (state.phase === 'match-over') return 'Match complete'
-  if (state.awaiting === HUMAN) {
-    return ''
-  }
-  return 'Bot is playing…'
-}
-
 export default function App() {
   const [state, setState] = useState(createGame)
 
@@ -115,7 +102,6 @@ export default function App() {
       <h1>Fox Lite</h1>
 
       <Status
-        message={statusMessage(state)}
         humanScore={state.score.human}
         botScore={state.score.bot}
       />
