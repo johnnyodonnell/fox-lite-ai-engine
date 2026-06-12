@@ -43,17 +43,22 @@ def main() -> int:
     chosen_mask = m[np.arange(c["n"]), a]
     legal_ok = bool(np.all(chosen_mask == 1.0))
     z_ok = bool(np.all(np.isin(z, [-1.0, 1.0])))
-    # history tokens: [card 0..32, self 0/1, valid 0/1] per slot, valid bits a
-    # prefix (events fill slots in play order, padding only at the tail)
+    # history tokens: [lead 0..32, follow 0..32, led-by-self 0/1, valid 0/1] per
+    # completed-trick slot, valid bits a prefix (slot 0 = most recent trick,
+    # padding only at the tail)
     tok = c["states"][:, :HIST].reshape(-1, HIST_TOKENS, TOKEN_FEATS)
-    card, self_bit, valid = tok[:, :, 0], tok[:, :, 1], tok[:, :, 2]
+    lead, follow, led_self, valid = tok[:, :, 0], tok[:, :, 1], tok[:, :, 2], tok[:, :, 3]
+    cards_ok = all(
+        bool(np.all((x >= 0) & (x < NUM_CARDS) & (x == np.floor(x))
+                    & (x * (1.0 - valid) == 0.0)))  # padded slots all-zero
+        for x in (lead, follow)
+    )
     tok_ok = bool(
-        np.all((card >= 0) & (card < NUM_CARDS) & (card == np.floor(card)))
-        and np.all(np.isin(self_bit, [0.0, 1.0]))
+        cards_ok
+        and np.all(np.isin(led_self, [0.0, 1.0]))
         and np.all(np.isin(valid, [0.0, 1.0]))
         and np.all(np.diff(valid, axis=1) <= 0)  # prefix-monotone
-        and np.all(card * (1.0 - valid) == 0.0)  # padded slots all-zero
-        and np.all(self_bit * (1.0 - valid) == 0.0)
+        and np.all(led_self * (1.0 - valid) == 0.0)
     )
     # each input row should have a fixed number of one-hot blocks set; spot-check
     # that own-hand counts are in 1..13 (mover always holds >=1 card on its turn)

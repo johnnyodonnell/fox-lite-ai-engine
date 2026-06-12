@@ -1,23 +1,28 @@
-"""Fox-Lite net v2: transformer history encoder + residual MLP trunk
-(policy + value heads).
+"""Fox-Lite net v3: transformer history encoder over trick tokens +
+learned-query attention readout + residual MLP trunk (policy + value heads).
 
-Input is the flat ~205-dim v2 encoding (see encode.py / encode.js / encode.rs):
-26 history tokens of [card index, played-by-self, valid] followed by a 127-dim
-static one-hot block. `forward` slices the flat row internally so the trainer,
-cohort format, ONNX export, and the Rust pipeline all keep a single [B, 205]
-input tensor.
+Input is the flat 209-dim v3 encoding (see encode.py / encode.js / encode.rs):
+12 trick tokens of [lead card index, follow card index, led-by-self, valid]
+(slot 0 = most recent completed trick) followed by a 161-dim static one-hot
+block. `forward` slices the flat row internally so the trainer, cohort format,
+ONNX export, and the Rust pipeline all keep a single [B, 209] input tensor.
 
-History encoder: token = card embedding + played-by-self embedding + learned
-positional embedding; N pre-LN self-attention blocks (explicit q/k/v/o Linears
-— no nn.MultiheadAttention, so the safetensors keys stay simple FQNs the Rust
-forward can mirror); additive key mask (valid-1)*1e9; final LayerNorm; masked
-mean-pool. An empty history (first lead of a round) pools to a zero vector by
-construction. The pooled vector is concatenated with the static block and fed
-to the same residual MLP trunk as v1.
+History encoder: token = lead-card embedding + follow-card embedding +
+led-by-self embedding + learned positional embedding; N pre-LN self-attention
+blocks (explicit q/k/v/o Linears — no nn.MultiheadAttention, so the
+safetensors keys stay simple FQNs the Rust forward can mirror); additive key
+mask (valid-1)*1e9; final LayerNorm; then an attention READOUT instead of a
+mean-pool: N_READOUT learned query vectors softmax-attend over the tokens and
+their pooled outputs are concatenated. No key/value projections: with learned
+constant queries a key projection is absorbed into the query, and a value
+projection into the stem. An empty history (no completed tricks yet) pools to
+a zero vector by construction (the readout is gated on any-valid). The pooled
+vectors are concatenated with the static block and fed to the same residual
+MLP trunk as v1/v2.
 
 State-dict key names are chosen to be loaded directly by the Rust tch forward
-(selfplay_rs/src/net.rs): hist_embed, hist_self_embed, hist_pos,
-hist_layers.{i}.{ln1,q,k,v,o,ln2,fc1,fc2}, hist_ln, stem,
+(selfplay_rs/src/net.rs): hist_lead_embed, hist_follow_embed, hist_led_embed,
+hist_pos, hist_layers.{i}.{ln1,q,k,v,o,ln2,fc1,fc2}, hist_ln, readout_q, stem,
 blocks.{i}.{ln1,fc1,ln2,fc2}, policy_ln/policy_fc, value_ln/value_fc1/value_fc2.
 """
 
@@ -29,7 +34,7 @@ import torch.nn.functional as F
 
 from encode import HIST, HIST_TOKENS, INPUT_SIZE, NUM_CARDS, TOKEN_FEATS
 
-STATIC_SIZE = INPUT_SIZE - HIST  # 127
+STATIC_SIZE = INPUT_SIZE - HIST  # 161
 
 WIDTH = 512
 N_BLOCKS = 4
@@ -41,6 +46,7 @@ N_LAYERS = 2
 N_HEADS = 4
 HEAD_DIM = D_MODEL // N_HEADS  # 32
 FFN = 256
+N_READOUT = 4
 
 MASK_NEG = 1.0e9  # same additive-mask constant as train.py's legal masking
 
@@ -89,14 +95,16 @@ class ResBlock(nn.Module):
 
 class FoxNet(nn.Module):
     def __init__(self, width=WIDTH, n_blocks=N_BLOCKS, policy_size=POLICY_SIZE,
-                 d_model=D_MODEL, n_layers=N_LAYERS):
+                 d_model=D_MODEL, n_layers=N_LAYERS, n_readout=N_READOUT):
         super().__init__()
-        self.hist_embed = nn.Embedding(NUM_CARDS, d_model)
-        self.hist_self_embed = nn.Embedding(2, d_model)
+        self.hist_lead_embed = nn.Embedding(NUM_CARDS, d_model)
+        self.hist_follow_embed = nn.Embedding(NUM_CARDS, d_model)
+        self.hist_led_embed = nn.Embedding(2, d_model)
         self.hist_pos = nn.Parameter(torch.zeros(HIST_TOKENS, d_model))
         self.hist_layers = nn.ModuleList([HistLayer(d_model) for _ in range(n_layers)])
         self.hist_ln = nn.LayerNorm(d_model)
-        self.stem = nn.Linear(STATIC_SIZE + d_model, width)
+        self.readout_q = nn.Parameter(torch.randn(n_readout, d_model) * 0.02)
+        self.stem = nn.Linear(STATIC_SIZE + n_readout * d_model, width)
         self.blocks = nn.ModuleList([ResBlock(width) for _ in range(n_blocks)])
         self.policy_ln = nn.LayerNorm(width)
         self.policy_fc = nn.Linear(width, policy_size)
@@ -108,17 +116,26 @@ class FoxNet(nn.Module):
         """x: [B, INPUT_SIZE] -> (policy_logits [B, 33], value [B])."""
         tok = x[:, :HIST].reshape(-1, HIST_TOKENS, TOKEN_FEATS)
         static = x[:, HIST:]
-        card = tok[:, :, 0].long()
-        self_bit = tok[:, :, 1].long()
-        valid = tok[:, :, 2]  # [B, T]
+        lead = tok[:, :, 0].long()
+        follow = tok[:, :, 1].long()
+        led_self = tok[:, :, 2].long()
+        valid = tok[:, :, 3]  # [B, T]
 
-        h = self.hist_embed(card) + self.hist_self_embed(self_bit) + self.hist_pos
+        h = (self.hist_lead_embed(lead) + self.hist_follow_embed(follow)
+             + self.hist_led_embed(led_self) + self.hist_pos)
         addmask = ((valid - 1.0) * MASK_NEG).reshape(-1, 1, 1, HIST_TOKENS)
         for layer in self.hist_layers:
             h = layer(h, addmask)
         h = self.hist_ln(h)
-        vm = valid.unsqueeze(-1)
-        pooled = (h * vm).sum(dim=1) / vm.sum(dim=1).clamp(min=1.0)
+
+        # Attention readout: scores [B,T,Q], softmax over tokens, pooled [B,Q,d].
+        scores = h.matmul(self.readout_q.t()) / math.sqrt(D_MODEL)
+        scores = scores + ((valid - 1.0) * MASK_NEG).unsqueeze(-1)
+        att = F.softmax(scores, dim=1)
+        pooled = att.transpose(1, 2).matmul(h).flatten(1)  # [B, Q*d]
+        # Empty history: softmax over all-masked slots is uniform over padding,
+        # so gate the readout to an exact zero vector when no token is valid.
+        pooled = pooled * valid.amax(dim=1, keepdim=True)
 
         t = self.stem(torch.cat([static, pooled], dim=1))
         for block in self.blocks:

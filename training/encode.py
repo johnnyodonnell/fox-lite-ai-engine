@@ -6,11 +6,12 @@ sanity-check the Rust/JS encoders. It consumes a state dict shaped exactly like
 the JS game state (humanHand/botHand lists of {suit,rank,id}, trump, ledCard,
 tricksWon, score, trickNum, trickHistory, awaiting).
 
-v2 layout: [ history tokens | static one-hot blocks ]. One token per play
-event of the current round in play order (the in-progress trick's lead is just
-the last token); each token is [canonical card index, played-by-self, valid].
-Padded slots are all-zero; the valid bit disambiguates padding from a real
-card index 0 and is the net's attention/pooling mask.
+v3 layout: [ history tokens | static one-hot blocks ]. One token per COMPLETED
+trick of the current round, in DESCENDING order (slot 0 = most recent completed
+trick); the in-progress trick's lead is NOT a token — it lives in the static
+led-card block. Each token is [lead card index, follow card index, led-by-self,
+valid]. Padded slots are all-zero; the valid bit disambiguates padding from a
+real card index 0 and is the net's attention/readout mask.
 """
 
 from __future__ import annotations
@@ -30,20 +31,21 @@ TRICKS_PER_ROUND = 13
 TARGET_SCORE = 21
 
 # Block sizes (canonical layout).
-HIST_TOKENS = 2 * TRICKS_PER_ROUND  # 26 (max events in a round)
-TOKEN_FEATS = 3  # [card index 0..32, played-by-self 0/1, valid 0/1]
-HIST = HIST_TOKENS * TOKEN_FEATS  # 78
+HIST_TOKENS = TRICKS_PER_ROUND - 1  # 12 (max completed tricks at a decision)
+TOKEN_FEATS = 4  # [lead card 0..32, follow card 0..32, led-by-self 0/1, valid 0/1]
+HIST = HIST_TOKENS * TOKEN_FEATS  # 48
 _OWN_HAND = NUM_CARDS
 _TRUMP_RANK = NUM_RANKS
+_LED = NUM_CARDS + 1  # led card one-hot + "no led / I'm leading" slot
 _SELF_TRICKS = TRICKS_PER_ROUND + 1
 _OPP_TRICKS = TRICKS_PER_ROUND + 1
 _TRICK_NUM = TRICKS_PER_ROUND
 _SCORE_SLOTS = TARGET_SCORE
 
 INPUT_SIZE = (
-    HIST + _OWN_HAND + _TRUMP_RANK
+    HIST + _OWN_HAND + _TRUMP_RANK + _LED
     + _SELF_TRICKS + _OPP_TRICKS + _TRICK_NUM + _SCORE_SLOTS + _SCORE_SLOTS
-)  # 205
+)  # 209
 
 
 def _suit_index(suit: str) -> int:
@@ -92,19 +94,32 @@ def encode(state: dict, mover: Optional[str] = None) -> np.ndarray:
     opp_score = state["score"]["bot" if mover_is_human else "human"]
 
     cur = 0
+    # history tokens: completed tricks, most recent first. Events arrive in play
+    # order as (lead, follow) pairs; a trailing single event is the in-progress
+    # trick's lead and is skipped here (it equals state["ledCard"]).
     events = state["trickHistory"]
-    if len(events) > HIST_TOKENS:
-        raise RuntimeError(f"trickHistory length {len(events)} > {HIST_TOKENS}")
-    for i, ev in enumerate(events):
-        out[cur + i * TOKEN_FEATS] = canon_card_index(ev["card"], trump_idx)
-        out[cur + i * TOKEN_FEATS + 1] = 1.0 if ev["player"] == mover else 0.0
-        out[cur + i * TOKEN_FEATS + 2] = 1.0
+    n_complete = len(events) // 2
+    if n_complete > HIST_TOKENS:
+        raise RuntimeError(f"completed tricks {n_complete} > {HIST_TOKENS}")
+    for t in range(n_complete):
+        lead = events[2 * (n_complete - 1 - t)]
+        follow = events[2 * (n_complete - 1 - t) + 1]
+        base = cur + t * TOKEN_FEATS
+        out[base] = canon_card_index(lead["card"], trump_idx)
+        out[base + 1] = canon_card_index(follow["card"], trump_idx)
+        out[base + 2] = 1.0 if lead["player"] == mover else 0.0
+        out[base + 3] = 1.0
     cur += HIST
     for c in own_hand:
         out[cur + canon_card_index(c, trump_idx)] = 1.0
     cur += _OWN_HAND
     out[cur + (state["trump"]["rank"] - 1)] = 1.0
     cur += _TRUMP_RANK
+    if state["ledCard"] is not None:
+        out[cur + canon_card_index(state["ledCard"], trump_idx)] = 1.0
+    else:
+        out[cur + NUM_CARDS] = 1.0
+    cur += _LED
     out[cur + min(self_tricks, TRICKS_PER_ROUND)] = 1.0
     cur += _SELF_TRICKS
     out[cur + min(opp_tricks, TRICKS_PER_ROUND)] = 1.0

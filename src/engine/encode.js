@@ -16,16 +16,18 @@ export const NUM_CARDS = NUM_SUITS * NUM_RANKS // 33
 
 // Layout (canonical): a history-token block followed by one-hot static blocks.
 //
-// History tokens (v2): one token per play event of the current round, in play
-// order (trickHistory order — the in-progress trick's lead is just the last
-// token). Each token is [canonical card index, played-by-self, valid]. Padded
+// History tokens (v3): one token per COMPLETED trick of the current round, in
+// DESCENDING order (slot 0 = most recent completed trick). The in-progress
+// trick's lead is NOT a token — it lives in the static led-card block. Each
+// token is [lead card index, follow card index, led-by-self, valid]. Padded
 // slots are all-zero; the valid bit disambiguates padding from a real card
-// index 0 and is the net's attention/pooling mask.
-export const HIST_TOKENS = 2 * TRICKS_PER_ROUND // 26 (max events in a round)
-export const TOKEN_FEATS = 3 // [card index 0..32, played-by-self 0/1, valid 0/1]
-const HIST = HIST_TOKENS * TOKEN_FEATS // 78
+// index 0 and is the net's attention/readout mask.
+export const HIST_TOKENS = TRICKS_PER_ROUND - 1 // 12 (max completed tricks at a decision)
+export const TOKEN_FEATS = 4 // [lead card 0..32, follow card 0..32, led-by-self 0/1, valid 0/1]
+const HIST = HIST_TOKENS * TOKEN_FEATS // 48
 const OWN_HAND = NUM_CARDS // 33
 const TRUMP_RANK = NUM_RANKS // 11
+const LED = NUM_CARDS + 1 // 34 (led card one-hot + "no led / I'm leading" slot)
 const SELF_TRICKS = TRICKS_PER_ROUND + 1 // 14 (0..13)
 const OPP_TRICKS = TRICKS_PER_ROUND + 1 // 14
 const TRICK_NUM = TRICKS_PER_ROUND // 13 (1..13)
@@ -35,11 +37,12 @@ export const INPUT_SIZE =
   HIST +
   OWN_HAND +
   TRUMP_RANK +
+  LED +
   SELF_TRICKS +
   OPP_TRICKS +
   TRICK_NUM +
   SCORE_SLOTS +
-  SCORE_SLOTS // 205
+  SCORE_SLOTS // 209
 
 const suitIndex = (suit) => SUITS.indexOf(suit)
 
@@ -87,16 +90,22 @@ export function encode(state, mover = state.awaiting) {
   const oppScore = moverIsHuman ? state.score.bot : state.score.human
 
   let cur = 0
-  // history tokens (play order; padded slots stay all-zero)
+  // history tokens: completed tricks, most recent first. Events arrive in play
+  // order as (lead, follow) pairs; a trailing single event is the in-progress
+  // trick's lead and is skipped here (it equals state.ledCard).
   const events = state.trickHistory
-  if (events.length > HIST_TOKENS) {
-    throw new Error(`trickHistory length ${events.length} > ${HIST_TOKENS}`)
+  const nComplete = Math.floor(events.length / 2)
+  if (nComplete > HIST_TOKENS) {
+    throw new Error(`completed tricks ${nComplete} > ${HIST_TOKENS}`)
   }
-  for (let i = 0; i < events.length; i++) {
-    const ev = events[i]
-    out[cur + i * TOKEN_FEATS] = canonCardIndex(ev.card, trumpIdx)
-    out[cur + i * TOKEN_FEATS + 1] = ev.player === mover ? 1 : 0
-    out[cur + i * TOKEN_FEATS + 2] = 1
+  for (let t = 0; t < nComplete; t++) {
+    const lead = events[2 * (nComplete - 1 - t)]
+    const follow = events[2 * (nComplete - 1 - t) + 1]
+    const base = cur + t * TOKEN_FEATS
+    out[base] = canonCardIndex(lead.card, trumpIdx)
+    out[base + 1] = canonCardIndex(follow.card, trumpIdx)
+    out[base + 2] = lead.player === mover ? 1 : 0
+    out[base + 3] = 1
   }
   cur += HIST
   // own hand
@@ -105,6 +114,10 @@ export function encode(state, mover = state.awaiting) {
   // trump rank (suit is implied = canonical slot 0)
   out[cur + (state.trump.rank - 1)] = 1
   cur += TRUMP_RANK
+  // led card + "no led / I'm leading" flag
+  if (state.ledCard) out[cur + canonCardIndex(state.ledCard, trumpIdx)] = 1
+  else out[cur + NUM_CARDS] = 1
+  cur += LED
   // tricks won
   out[cur + Math.min(selfTricks, TRICKS_PER_ROUND)] = 1
   cur += SELF_TRICKS

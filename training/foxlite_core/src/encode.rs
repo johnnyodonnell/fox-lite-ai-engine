@@ -4,20 +4,23 @@
 //! Suits are permuted so trump is always canonical slot 0; policy outputs are
 //! over canonical card slots (invert with [`real_card_from_canon_index`]).
 //!
-//! v2 layout: `[ history tokens | static one-hot blocks ]`. One token per play
-//! event of the current round in play order (the in-progress trick's lead is
-//! just the last token); each token is [canonical card index, played-by-self,
-//! valid]. Padded slots are all-zero; the valid bit disambiguates padding from
-//! a real card index 0 and is the net's attention/pooling mask.
+//! v3 layout: `[ history tokens | static one-hot blocks ]`. One token per
+//! COMPLETED trick of the current round, in DESCENDING order (slot 0 = most
+//! recent completed trick); the in-progress trick's lead is NOT a token — it
+//! lives in the static led-card block. Each token is [lead card index, follow
+//! card index, led-by-self, valid]. Padded slots are all-zero; the valid bit
+//! disambiguates padding from a real card index 0 and is the net's
+//! attention/readout mask.
 
 use crate::{Card, Player, State, NUM_CARDS, NUM_RANKS, NUM_SUITS, TARGET_SCORE, TRICKS_PER_ROUND};
 
 // Block sizes (canonical layout).
-pub const HIST_TOKENS: usize = 2 * TRICKS_PER_ROUND as usize; // 26 (max events in a round)
-pub const TOKEN_FEATS: usize = 3; // [card index 0..32, played-by-self 0/1, valid 0/1]
-pub const HIST: usize = HIST_TOKENS * TOKEN_FEATS; // 78
+pub const HIST_TOKENS: usize = TRICKS_PER_ROUND as usize - 1; // 12 (max completed tricks at a decision)
+pub const TOKEN_FEATS: usize = 4; // [lead card 0..32, follow card 0..32, led-by-self 0/1, valid 0/1]
+pub const HIST: usize = HIST_TOKENS * TOKEN_FEATS; // 48
 const OWN_HAND: usize = NUM_CARDS; // 33
 const TRUMP_RANK: usize = NUM_RANKS; // 11
+const LED: usize = NUM_CARDS + 1; // 34 (led card one-hot + "no led / I'm leading" slot)
 const SELF_TRICKS: usize = TRICKS_PER_ROUND as usize + 1; // 14
 const OPP_TRICKS: usize = TRICKS_PER_ROUND as usize + 1; // 14
 const TRICK_NUM: usize = TRICKS_PER_ROUND as usize; // 13
@@ -26,13 +29,14 @@ const SCORE_SLOTS: usize = TARGET_SCORE as usize; // 21
 /// Size of the static (non-token) tail of the encoding.
 pub const STATIC_SIZE: usize = OWN_HAND
     + TRUMP_RANK
+    + LED
     + SELF_TRICKS
     + OPP_TRICKS
     + TRICK_NUM
     + SCORE_SLOTS
-    + SCORE_SLOTS; // 127
+    + SCORE_SLOTS; // 161
 
-pub const INPUT_SIZE: usize = HIST + STATIC_SIZE; // 205
+pub const INPUT_SIZE: usize = HIST + STATIC_SIZE; // 209
 
 /// Map a real suit index to its canonical slot given the trump suit index.
 #[inline]
@@ -93,19 +97,103 @@ pub fn encode(state: &State, mover: Player) -> Vec<f32> {
     let opp_score = state.score[opp.idx()] as usize;
 
     let mut cur = 0;
+    // history tokens: completed tricks, most recent first. Events arrive in
+    // play order as (lead, follow) pairs; a trailing single event is the
+    // in-progress trick's lead and is skipped here (it equals state.led_card).
+    let events = &state.trick_history;
+    let n_complete = events.len() / 2;
+    assert!(
+        n_complete <= HIST_TOKENS,
+        "completed tricks {n_complete} > {HIST_TOKENS}"
+    );
+    for t in 0..n_complete {
+        let lead = events[2 * (n_complete - 1 - t)];
+        let follow = events[2 * (n_complete - 1 - t) + 1];
+        let base = cur + t * TOKEN_FEATS;
+        out[base] = canon_card_index(lead.card, trump) as f32;
+        out[base + 1] = canon_card_index(follow.card, trump) as f32;
+        out[base + 2] = if lead.player == mover { 1.0 } else { 0.0 };
+        out[base + 3] = 1.0;
+    }
+    cur += HIST;
+    // own hand
+    for c in own_hand {
+        out[cur + canon_card_index(*c, trump)] = 1.0;
+    }
+    cur += OWN_HAND;
+    // trump rank (suit implied = canonical slot 0)
+    out[cur + (state.trump.rank as usize - 1)] = 1.0;
+    cur += TRUMP_RANK;
+    // led card + "no led / I'm leading" flag
+    match state.led_card {
+        Some(led) => out[cur + canon_card_index(led, trump)] = 1.0,
+        None => out[cur + NUM_CARDS] = 1.0,
+    }
+    cur += LED;
+    // tricks won
+    out[cur + self_tricks.min(TRICKS_PER_ROUND as usize)] = 1.0;
+    cur += SELF_TRICKS;
+    out[cur + opp_tricks.min(TRICKS_PER_ROUND as usize)] = 1.0;
+    cur += OPP_TRICKS;
+    // trick number (1..13)
+    out[cur + (state.trick_num as usize - 1)] = 1.0;
+    cur += TRICK_NUM;
+    // match scores (one-hot 0..20, clamped)
+    out[cur + self_score.min(SCORE_SLOTS - 1)] = 1.0;
+    cur += SCORE_SLOTS;
+    out[cur + opp_score.min(SCORE_SLOTS - 1)] = 1.0;
+    cur += SCORE_SLOTS;
+
+    debug_assert_eq!(cur, INPUT_SIZE);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// v2 encoding (flat play-event tokens, INPUT_SIZE 205) — kept so legacy
+// snapshots (run4) can be evaluated against current nets. Verbatim the
+// pre-v3 layout: 26 tokens of [card index, played-by-self, valid], no LED
+// block.
+// ---------------------------------------------------------------------------
+pub const HIST_TOKENS_V2: usize = 2 * TRICKS_PER_ROUND as usize; // 26 (max events in a round)
+pub const TOKEN_FEATS_V2: usize = 3; // [card index 0..32, played-by-self 0/1, valid 0/1]
+pub const HIST_V2: usize = HIST_TOKENS_V2 * TOKEN_FEATS_V2; // 78
+
+pub const STATIC_SIZE_V2: usize = OWN_HAND
+    + TRUMP_RANK
+    + SELF_TRICKS
+    + OPP_TRICKS
+    + TRICK_NUM
+    + SCORE_SLOTS
+    + SCORE_SLOTS; // 127
+
+pub const INPUT_SIZE_V2: usize = HIST_V2 + STATIC_SIZE_V2; // 205
+
+/// v2 encode of `state` from `mover`'s perspective: length `INPUT_SIZE_V2`.
+pub fn encode_v2(state: &State, mover: Player) -> Vec<f32> {
+    let mut out = vec![0.0f32; INPUT_SIZE_V2];
+    let trump = state.trump.suit;
+    let opp = mover.other();
+
+    let own_hand = state.hand(mover);
+    let self_tricks = state.tricks_won[mover.idx()] as usize;
+    let opp_tricks = state.tricks_won[opp.idx()] as usize;
+    let self_score = state.score[mover.idx()] as usize;
+    let opp_score = state.score[opp.idx()] as usize;
+
+    let mut cur = 0;
     // history tokens (play order; padded slots stay all-zero)
     let events = &state.trick_history;
     assert!(
-        events.len() <= HIST_TOKENS,
-        "trickHistory length {} > {HIST_TOKENS}",
+        events.len() <= HIST_TOKENS_V2,
+        "trickHistory length {} > {HIST_TOKENS_V2}",
         events.len()
     );
     for (i, ev) in events.iter().enumerate() {
-        out[cur + i * TOKEN_FEATS] = canon_card_index(ev.card, trump) as f32;
-        out[cur + i * TOKEN_FEATS + 1] = if ev.player == mover { 1.0 } else { 0.0 };
-        out[cur + i * TOKEN_FEATS + 2] = 1.0;
+        out[cur + i * TOKEN_FEATS_V2] = canon_card_index(ev.card, trump) as f32;
+        out[cur + i * TOKEN_FEATS_V2 + 1] = if ev.player == mover { 1.0 } else { 0.0 };
+        out[cur + i * TOKEN_FEATS_V2 + 2] = 1.0;
     }
-    cur += HIST;
+    cur += HIST_V2;
     // own hand
     for c in own_hand {
         out[cur + canon_card_index(*c, trump)] = 1.0;
@@ -128,7 +216,7 @@ pub fn encode(state: &State, mover: Player) -> Vec<f32> {
     out[cur + opp_score.min(SCORE_SLOTS - 1)] = 1.0;
     cur += SCORE_SLOTS;
 
-    debug_assert_eq!(cur, INPUT_SIZE);
+    debug_assert_eq!(cur, INPUT_SIZE_V2);
     out
 }
 
@@ -140,7 +228,6 @@ pub fn encode(state: &State, mover: Player) -> Vec<f32> {
 const PLAYED_SELF: usize = NUM_CARDS; // 33
 const PLAYED_OPP: usize = NUM_CARDS; // 33
 const OPP_VOIDS: usize = NUM_SUITS; // 3
-const LED: usize = NUM_CARDS + 1; // 34
 
 pub const INPUT_SIZE_V1: usize = OWN_HAND
     + PLAYED_SELF
@@ -261,10 +348,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_size_is_205() {
-        assert_eq!(INPUT_SIZE, 205);
-        assert_eq!(STATIC_SIZE, 127);
-        assert_eq!(HIST, 78);
+    fn input_sizes() {
+        assert_eq!(INPUT_SIZE, 209);
+        assert_eq!(STATIC_SIZE, 161);
+        assert_eq!(HIST, 48);
+        assert_eq!(INPUT_SIZE_V2, 205);
+        assert_eq!(STATIC_SIZE_V2, 127);
+        assert_eq!(HIST_V2, 78);
+        assert_eq!(INPUT_SIZE_V1, 230);
     }
 
     #[test]

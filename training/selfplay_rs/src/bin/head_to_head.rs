@@ -1,8 +1,9 @@
 //! head_to_head — play two snapshots against each other directly, cross-arch.
 //!
-//! Each side's arch (v1 pre-history MLP / v2 history transformer) is detected
-//! from its safetensors keys, and each side encodes the shared game state with
-//! its own encoding (v1: 230, v2: 205). Play mechanics match evaluate_rs:
+//! Each side's arch (v1 pre-history MLP / v2 flat-token transformer / v3
+//! trick-token transformer) is detected from its safetensors keys, and each
+//! side encodes the shared game state with its own encoding (v1: 230, v2: 205,
+//! v3: 209). Play mechanics match evaluate_rs:
 //! greedy argmax over legal moves, mirrored seating, no draws. Results are
 //! printed only — pool.json is untouched (the two runs' Elo scales are not
 //! comparable anyway).
@@ -16,7 +17,8 @@ use rand::SeedableRng;
 use tch::{Device, Kind, Tensor};
 
 use foxlite_core::encode::{
-    encode, encode_v1, legal_mask, real_card_from_canon_index, INPUT_SIZE, INPUT_SIZE_V1,
+    encode, encode_v1, encode_v2, legal_mask, real_card_from_canon_index, INPUT_SIZE,
+    INPUT_SIZE_V1, INPUT_SIZE_V2,
 };
 use foxlite_core::{Phase, Player, State, NUM_CARDS};
 use selfplay_rs::net::AnyNet;
@@ -38,6 +40,7 @@ impl NetAgent {
         match self.net {
             AnyNet::V1(_) => "v1",
             AnyNet::V2(_) => "v2",
+            AnyNet::V3(_) => "v3",
         }
     }
 
@@ -46,7 +49,8 @@ impl NetAgent {
         let mask = legal_mask(state, mover);
         let (v, size) = match self.net {
             AnyNet::V1(_) => (encode_v1(state, mover), INPUT_SIZE_V1),
-            AnyNet::V2(_) => (encode(state, mover), INPUT_SIZE),
+            AnyNet::V2(_) => (encode_v2(state, mover), INPUT_SIZE_V2),
+            AnyNet::V3(_) => (encode(state, mover), INPUT_SIZE),
         };
         let x = Tensor::from_slice(&v)
             .reshape([1, size as i64])
