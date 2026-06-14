@@ -42,7 +42,10 @@ def main() -> int:
     a, m, z = c["actions"], c["masks"], c["z"]
     chosen_mask = m[np.arange(c["n"]), a]
     legal_ok = bool(np.all(chosen_mask == 1.0))
-    z_ok = bool(np.all(np.isin(z, [-1.0, 1.0])))
+    # z is the per-round reward: normalized point differential (multiples of 1/6
+    # in [-1, 1]) for non-deciding rounds, exactly ±1 for the match-deciding one.
+    z6 = z * 6.0
+    z_ok = bool(np.all((z >= -1.0) & (z <= 1.0) & (np.abs(z6 - np.round(z6)) < 1e-4)))
     # history tokens: [lead 0..32, follow 0..32, led-by-self 0/1, valid 0/1] per
     # completed-trick slot, valid bits a prefix (slot 0 = most recent trick,
     # padding only at the tail)
@@ -65,7 +68,7 @@ def main() -> int:
     own_hand_counts = c["states"][:, HIST:HIST + NUM_CARDS].sum(axis=1)
     print(f"rows={c['n']}")
     print(f"  chosen-action-legal: {legal_ok}")
-    print(f"  z in {{-1,1}}: {z_ok}   z.mean={float(z.mean()):+.3f}")
+    print(f"  z in [-1,1] (sixths): {z_ok}   z.mean={float(z.mean()):+.3f}")
     print(f"  history tokens well-formed: {tok_ok}")
     print(f"  valid-token count range: [{int(valid.sum(axis=1).min())},{int(valid.sum(axis=1).max())}]")
     print(f"  action idx range: [{int(a.min())},{int(a.max())}]")

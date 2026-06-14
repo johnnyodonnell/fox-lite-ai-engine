@@ -38,7 +38,9 @@ use foxlite_core::{Phase, Player, State, NUM_CARDS};
 
 use crate::cuda_event::CudaEvent;
 use crate::net::Net;
-use crate::selfplay::{sample_action, write_cohort};
+use crate::selfplay::{
+    emit_decision, round_decides_match, round_points, round_reward, sample_action, write_cohort,
+};
 
 pub struct Config {
     pub weights: String,
@@ -53,7 +55,9 @@ pub struct Config {
     pub cpu: bool,
 }
 
-/// One recorded decision; flushed to the cohort with z = ±1 when the match ends.
+/// One recorded decision. Non-deciding rounds are flushed to `InFlight::rows`
+/// scored on their own points; the match-deciding round's decisions stay here
+/// and are flushed with z = ±1 when the match ends.
 struct Decision {
     state: Vec<f32>,
     mask: [f32; NUM_CARDS],
@@ -64,7 +68,9 @@ struct Decision {
 /// A game in flight through the pipeline.
 struct InFlight {
     state: State,
-    decisions: Vec<Decision>,
+    decisions: Vec<Decision>, // current round only (drained at each round boundary)
+    rows: Vec<f32>,           // cohort rows for completed non-deciding rounds
+    n_rows: u64,              // decisions already emitted into `rows`
     rng: StdRng,
     staged_enc: Vec<f32>, // encoding of the decision currently awaiting a forward
     staged_mover: Player, // seat to move at that decision
@@ -155,6 +161,8 @@ fn spawn_fresh(base_seed: u64, id: u64) -> Box<InFlight> {
     Box::new(InFlight {
         state,
         decisions: Vec::new(),
+        rows: Vec::new(),
+        n_rows: 0,
         rng,
         staged_enc: Vec::new(),
         staged_mover: Player::Human,
@@ -180,6 +188,18 @@ fn advance(g: &mut InFlight) -> Advance {
             }
             Phase::TrickComplete => g.state.advance_after_trick(),
             Phase::RoundOver => {
+                let pts = round_points(&g.state);
+                // Non-deciding round: score each decision on this round's points
+                // and move it to `rows`, leaving `decisions` empty for the next
+                // round. A deciding round is left for `finalize_local` (match z).
+                if !round_decides_match(&g.state, pts) {
+                    let z = round_reward(pts);
+                    let decisions = std::mem::take(&mut g.decisions);
+                    g.n_rows += decisions.len() as u64;
+                    for d in &decisions {
+                        emit_decision(&mut g.rows, &d.state, &d.mask, d.action, z[d.seat.idx()]);
+                    }
+                }
                 let mut rng = std::mem::replace(&mut g.rng, StdRng::seed_from_u64(0));
                 g.state.end_round(&mut rng);
                 g.rng = rng;
@@ -227,12 +247,14 @@ fn acquire(shared: &Shared) -> Option<Box<InFlight>> {
 
 /// Flush a finished game's decisions into the worker-local cohort buffer.
 fn finalize_local(out: &mut WorkerOut, g: &InFlight, winner: Player) {
+    // Non-deciding rounds were already scored on their own points into `g.rows`.
+    out.rows.extend_from_slice(&g.rows);
+    out.total_decisions += g.n_rows;
+    // Whatever decisions remain are the match-deciding round; score them on the
+    // match outcome, not the points that round scored.
     for d in &g.decisions {
         let z = if d.seat == winner { 1.0f32 } else { -1.0f32 };
-        out.rows.extend_from_slice(&d.state);
-        out.rows.extend_from_slice(&d.mask);
-        out.rows.push(d.action as f32);
-        out.rows.push(z);
+        emit_decision(&mut out.rows, &d.state, &d.mask, d.action, z);
     }
     out.total_decisions += g.decisions.len() as u64;
     out.wins[winner.idx()] += 1;

@@ -2,9 +2,12 @@
 //!
 //! Plays full matches-to-21 current-vs-current with the loaded net. At each
 //! decision the net's policy logits (masked to legal, temperature-applied) are
-//! sampled for the move. Every decision is recorded; when a match ends, each
-//! decision gets z = +1/-1 from that seat's frame (match win/loss). Rows are
-//! written to a flat f32 cohort file the Python REINFORCE trainer consumes.
+//! sampled for the move. Every decision is recorded and rewarded per round: a
+//! round that does NOT decide the match is judged on the points it scored
+//! (normalized point differential in [-1, 1]); the round that ends the match is
+//! judged on the match outcome (+1/-1 from that seat's frame), so its own points
+//! don't matter. Rows are written to a flat f32 cohort file the Python REINFORCE
+//! trainer consumes.
 //!
 //! Row layout (ROW_FLOATS = INPUT_SIZE + NUM_CARDS + 2):
 //!   [ state(INPUT_SIZE) | legal_mask(NUM_CARDS) | action_index | z ]
@@ -19,11 +22,54 @@ use rand::{Rng, SeedableRng};
 use tch::{Device, Kind, Tensor};
 
 use foxlite_core::encode::{encode, legal_mask, real_card_from_canon_index, INPUT_SIZE};
-use foxlite_core::{Phase, Player, State, NUM_CARDS};
+use foxlite_core::{score_for_tricks, Phase, Player, State, NUM_CARDS, TARGET_SCORE};
 
 use crate::net::Net;
 
 pub const ROW_FLOATS: usize = INPUT_SIZE + NUM_CARDS + 2;
+
+/// Max points a seat can score in a single round (0-3 or 7-9 tricks => 6). Used
+/// to normalize the per-round reward to roughly [-1, 1] so it shares a scale
+/// with the +1/-1 match-deciding reward (keeps the value-loss weight sane).
+const MAX_ROUND_POINTS: f32 = 6.0;
+
+/// Points scored this round by [Human, Bot], read from a `RoundOver` state
+/// (before `end_round` deals the next round / ends the match).
+pub(crate) fn round_points(state: &State) -> [u32; 2] {
+    [
+        score_for_tricks(state.tricks_won[Player::Human.idx()]),
+        score_for_tricks(state.tricks_won[Player::Bot.idx()]),
+    ]
+}
+
+/// Whether this round ends the match — i.e. either seat reaches the target once
+/// `pts` (from [`round_points`]) is added to the running score.
+pub(crate) fn round_decides_match(state: &State, pts: [u32; 2]) -> bool {
+    state.score[Player::Human.idx()] + pts[0] >= TARGET_SCORE
+        || state.score[Player::Bot.idx()] + pts[1] >= TARGET_SCORE
+}
+
+/// Per-seat reward [Human, Bot] for a non-deciding round: normalized point
+/// differential. A match-deciding round uses +1/-1 by winner instead (its own
+/// points don't matter).
+pub(crate) fn round_reward(pts: [u32; 2]) -> [f32; 2] {
+    let diff = (pts[0] as f32 - pts[1] as f32) / MAX_ROUND_POINTS;
+    [diff, -diff]
+}
+
+/// Append one decision's row (state | legal_mask | action | z) to a cohort buffer.
+pub(crate) fn emit_decision(
+    rows: &mut Vec<f32>,
+    state: &[f32],
+    mask: &[f32; NUM_CARDS],
+    action: u32,
+    z: f32,
+) {
+    rows.extend_from_slice(state);
+    rows.extend_from_slice(mask);
+    rows.push(action as f32);
+    rows.push(z);
+}
 
 pub struct Config {
     pub weights: String,
@@ -117,20 +163,33 @@ pub fn run(cfg: Config) {
                 match phase {
                     Phase::Playing => break,
                     Phase::TrickComplete => slots[i].as_mut().unwrap().state.advance_after_trick(),
-                    Phase::RoundOver => slots[i].as_mut().unwrap().state.end_round(&mut rng),
+                    Phase::RoundOver => {
+                        let g = slots[i].as_mut().unwrap();
+                        let pts = round_points(&g.state);
+                        // A non-deciding round is scored on its own points now and
+                        // flushed, so the buffer only ever holds the current round;
+                        // a deciding round is left for the MatchOver branch below.
+                        if !round_decides_match(&g.state, pts) {
+                            let z = round_reward(pts);
+                            total_decisions += g.decisions.len() as u64;
+                            for d in g.decisions.drain(..) {
+                                emit_decision(&mut rows, &d.state, &d.mask, d.action, z[d.seat.idx()]);
+                            }
+                        }
+                        g.state.end_round(&mut rng);
+                    }
                     Phase::MatchOver => {
                         let winner = slots[i].as_ref().unwrap().state.match_winner().unwrap();
                         wins[winner.idx()] += 1;
                         {
-                            let g = slots[i].as_ref().unwrap();
-                            for d in &g.decisions {
-                                let z = if d.seat == winner { 1.0 } else { -1.0 };
-                                rows.extend_from_slice(&d.state);
-                                rows.extend_from_slice(&d.mask);
-                                rows.push(d.action as f32);
-                                rows.push(z);
-                            }
+                            // Only the match-deciding round remains; score it on
+                            // the match outcome, not the points it scored.
+                            let g = slots[i].as_mut().unwrap();
                             total_decisions += g.decisions.len() as u64;
+                            for d in g.decisions.drain(..) {
+                                let z = if d.seat == winner { 1.0 } else { -1.0 };
+                                emit_decision(&mut rows, &d.state, &d.mask, d.action, z);
+                            }
                         }
                         finished += 1;
                         if started < cfg.matches {
