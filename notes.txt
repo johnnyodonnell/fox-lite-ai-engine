@@ -26,6 +26,11 @@
             all of the moves are determined by Double Dummy.
     - Train model to play good rounds instead of good matches
     - Any of the above already listed but with a bigger net
+    - Some type of CFR implementation
+        * This feels a little bit more complext, and something outside
+            of my area of comfort right now. But this keeps coming up
+            and could be a good idea to try at some point.
+        * Some of the ideas recommended include DeepCFR and ReBeL
 
 * Approaches tried
     - ISMCTS + NN
