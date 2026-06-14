@@ -71,12 +71,23 @@ pub(crate) fn emit_decision(
     rows.push(z);
 }
 
+/// Per-round sampling temperature: anneal linearly from `start` (a round's first
+/// trick) to `end` (its last) across the 13 tricks. `trick_num` is 1-based and
+/// resets each round, so the schedule restarts every round — fitting, since with
+/// per-round `z` each round is its own reward episode. `start == end` disables it.
+pub(crate) fn round_temp(start: f64, end: f64, trick_num: u32) -> f64 {
+    const TRICKS_PER_ROUND: f64 = 13.0;
+    let frac = ((trick_num.max(1) - 1) as f64 / (TRICKS_PER_ROUND - 1.0)).clamp(0.0, 1.0);
+    start + (end - start) * frac
+}
+
 pub struct Config {
     pub weights: String,
     pub out: String,
     pub matches: usize,
     pub batch: usize,
     pub temperature: f64,
+    pub temp_end: f64,
     pub seed: u64,
     pub cpu: bool,
 }
@@ -231,7 +242,8 @@ pub fn run(cfg: Config) {
             let mover = g.state.awaiting.unwrap();
             let mask = legal_mask(&g.state, mover);
             let logit_row = &lbuf[k * NUM_CARDS..(k + 1) * NUM_CARDS];
-            let action = sample_action(logit_row, &mask, cfg.temperature, &mut rng);
+            let temp = round_temp(cfg.temperature, cfg.temp_end, g.state.trick_num);
+            let action = sample_action(logit_row, &mask, temp, &mut rng);
             let state_vec = enc_flat[k * INPUT_SIZE..(k + 1) * INPUT_SIZE].to_vec();
             g.decisions.push(Decision {
                 state: state_vec,

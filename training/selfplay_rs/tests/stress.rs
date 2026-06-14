@@ -64,6 +64,7 @@ fn micro_cohorts_never_wedge() {
             n_threads: threads,
             slots,
             temperature: 1.0,
+            temp_end: 1.0,
             seed: i as u64,
             cpu: true,
         };

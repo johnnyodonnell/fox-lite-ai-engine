@@ -39,7 +39,8 @@ use foxlite_core::{Phase, Player, State, NUM_CARDS};
 use crate::cuda_event::CudaEvent;
 use crate::net::Net;
 use crate::selfplay::{
-    emit_decision, round_decides_match, round_points, round_reward, sample_action, write_cohort,
+    emit_decision, round_decides_match, round_points, round_reward, round_temp, sample_action,
+    write_cohort,
 };
 
 pub struct Config {
@@ -50,7 +51,8 @@ pub struct Config {
     pub concurrency: usize, // games kept in flight; > batch overlaps CPU with GPU
     pub n_threads: usize,   // game-worker threads
     pub slots: usize,       // forwards in flight (inference can run ahead of scatter)
-    pub temperature: f64,
+    pub temperature: f64,   // sampling temperature at a round's first trick
+    pub temp_end: f64,      // ...annealed to this by the round's last trick
     pub seed: u64,
     pub cpu: bool,
 }
@@ -123,6 +125,7 @@ struct Shared {
     matches: usize,
     concurrency: usize,
     temperature: f64,
+    temp_end: f64,
     seed: u64,
 }
 
@@ -211,12 +214,13 @@ fn advance(g: &mut InFlight) -> Advance {
 
 /// Apply the forward result for the staged decision: sample a move, record the
 /// decision, and play it. Leaves `g` at the post-move phase for `advance`.
-fn apply_pending(g: &mut InFlight, temperature: f64) {
+fn apply_pending(g: &mut InFlight, temp_start: f64, temp_end: f64) {
     let (logits, row) = g.pending.take().expect("apply_pending without pending result");
     let mover = g.staged_mover;
     let mask = legal_mask(&g.state, mover);
     let logit_row = &logits[row * NUM_CARDS..(row + 1) * NUM_CARDS];
-    let action = sample_action(logit_row, &mask, temperature, &mut g.rng);
+    let temp = round_temp(temp_start, temp_end, g.state.trick_num);
+    let action = sample_action(logit_row, &mask, temp, &mut g.rng);
     let state_vec = std::mem::take(&mut g.staged_enc);
     g.decisions.push(Decision { state: state_vec, mask, action: action as u32, seat: mover });
     let card = real_card_from_canon_index(action, g.state.trump.suit);
@@ -282,7 +286,7 @@ fn worker_loop(shared: Arc<Shared>) -> WorkerOut {
     let mut out = WorkerOut::default();
     while let Some(mut g) = acquire(&shared) {
         if g.pending.is_some() {
-            apply_pending(&mut g, shared.temperature);
+            apply_pending(&mut g, shared.temperature, shared.temp_end);
         }
         match advance(&mut g) {
             Advance::Eval => stage(&shared, g),
@@ -385,7 +389,7 @@ pub fn run(cfg: Config) {
 
 /// Persistent worker: initialize CUDA/libtorch once, then run one cohort per
 /// newline-delimited JSON command on stdin (`{weights,out,matches,batch,
-/// concurrency,threads,slots,temperature,seed}`, plus optional `quit`). Reloads
+/// concurrency,threads,slots,temperature,seed}`, optional `temp_end`/`quit`). Reloads
 /// weights per command (a few ms for this net) and acks each cohort with a
 /// `{"done":true}` line — the cohort itself is handed off via the `out` file.
 pub fn serve(dev: Device) {
@@ -430,6 +434,10 @@ struct ServeCmd {
     threads: usize,
     slots: usize,
     temperature: f64,
+    // Optional so older callers (and the `quit` message) still parse; defaults to
+    // `temperature` in `into_config`, i.e. no annealing unless explicitly set.
+    #[serde(default)]
+    temp_end: Option<f64>,
     seed: u64,
     #[serde(default)]
     cpu: bool,
@@ -448,6 +456,7 @@ impl ServeCmd {
             n_threads: self.threads,
             slots: self.slots,
             temperature: self.temperature,
+            temp_end: self.temp_end.unwrap_or(self.temperature),
             seed: self.seed,
             cpu: self.cpu,
         }
@@ -483,6 +492,7 @@ pub fn run_with_forward(cfg: &Config, forward: &dyn Fn(&Tensor) -> Tensor, dev: 
         matches: cfg.matches,
         concurrency,
         temperature: cfg.temperature,
+        temp_end: cfg.temp_end,
         seed: cfg.seed,
     });
 

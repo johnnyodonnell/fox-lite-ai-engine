@@ -22,7 +22,11 @@ exec python orchestrator.py \
   --selfplay-threads "${SELFPLAY_THREADS:-16}" \
   --sgd-batch "${SGD_BATCH:-65536}" \
   --lr "${LR:-1e-3}" \
-  --c-entropy "${C_ENTROPY:-0.01}" \
+  --temperature "${TEMPERATURE:-1.0}" \
+  --temp-end "${TEMP_END:-0.5}" \
+  --alpha-init "${ALPHA_INIT:-0.05}" \
+  --alpha-lr "${ALPHA_LR:-0.02}" \
+  --ent-target-frac "${ENT_TARGET_FRAC:-0.5}" \
   --eval-games "${EVAL_GAMES:-200}" \
   --n-top "${N_TOP:-2}" \
   --n-anchors "${N_ANCHORS:-3}" \

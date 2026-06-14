@@ -95,12 +95,14 @@ fn main() {
             std::process::exit(if ok { 0 } else { 1 });
         }
         "selfplay" => {
+            let temperature: f64 = flag(&args, "--temperature", "1.0").parse().unwrap();
             let cfg = selfplay::Config {
                 weights: flag(&args, "--weights", "weights.safetensors"),
                 out: flag(&args, "--out", "cohort.bin"),
                 matches: flag(&args, "--matches", "1024").parse().unwrap(),
                 batch: flag(&args, "--batch", "512").parse().unwrap(),
-                temperature: flag(&args, "--temperature", "1.0").parse().unwrap(),
+                temperature,
+                temp_end: flag(&args, "--temp-end", &temperature.to_string()).parse().unwrap(),
                 seed: flag(&args, "--seed", "0").parse().unwrap(),
                 cpu: args.iter().any(|a| a == "--cpu"),
             };
@@ -108,6 +110,7 @@ fn main() {
         }
         "selfplay-pipe" => {
             let batch: usize = flag(&args, "--batch", "512").parse().unwrap();
+            let temperature: f64 = flag(&args, "--temperature", "1.0").parse().unwrap();
             let cfg = pipeline::Config {
                 weights: flag(&args, "--weights", "weights.safetensors"),
                 out: flag(&args, "--out", "cohort.bin"),
@@ -119,7 +122,8 @@ fn main() {
                 // forwards in flight: inference can run this many forwards ahead of the
                 // scatter thread's readback (2 = double-buffer; keeps the GPU fed).
                 slots: flag(&args, "--slots", "2").parse().unwrap(),
-                temperature: flag(&args, "--temperature", "1.0").parse().unwrap(),
+                temperature,
+                temp_end: flag(&args, "--temp-end", &temperature.to_string()).parse().unwrap(),
                 seed: flag(&args, "--seed", "0").parse().unwrap(),
                 cpu: args.iter().any(|a| a == "--cpu"),
             };
