@@ -1,6 +1,5 @@
 
 * Feature ideas
-    - Include the full hand history as input into the NN model
     - Train with different model architectures (e.g. NFSP) and see
         if we can outperform our current model
     - NN-assisted determination
@@ -40,7 +39,35 @@
             and could be a good idea to try at some point.
         * Some of the ideas recommended include DeepCFR and ReBeL
 
-* Approaches tried
+* Successful attempts
+    - Include the full hand history as input into the NN model
+        * The model takes ~3x as long to train a cohort and therefore
+            the self-play/training loop takes about ~2x as long. So to
+            train the model with full hand history takes ~2x as long,
+            but we were able to show that it beats the model w/o
+            full hand history with less than 2x the training time.
+        * We also found that the model w/o full hand history likely didn't
+            plateau even though it had 2 successive declines in Elo with
+            4hr gaps in between snapshots (544 -> 537 -> 527). When we ran
+            our top models w/ full hand history against these model, they
+            performed worst against 527 and second worst against 537.
+            So the model w/o full hand history likely had more to gain
+            by continuing to run it.
+        * The model w/ full hand history hadn't hit a plateau in Elo
+            ratings or performance. When we stopped the model w/ full
+            hand history it was still consistently gaining Elo even
+            though it was gaining small increases in Elo.
+        * The model w/ full hand history was intentionally weaker than
+            it otherwise could have been. We could have added full hand
+            history and also kept cards played and voids seen as one-hots
+            but I decided to leave those out to (1) make the model feel
+            more natural, (2) ensure that hand history was being used
+            by the model, and (3) make a more generic model that can
+            be used for other card games. But if we wanted, we could have
+            included full hand history, cards played, and voids seen; which
+            would have likely created the strongest model seen yet.
+
+* Failed attempts
     - ISMCTS + NN
         * The idea was to match chess-ai-engine's (https://github.com/johnnyodonnell/chess-ai-engine)
             AlphaZero approach, but we just didn't get very good results
