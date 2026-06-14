@@ -24,6 +24,14 @@
         * Also, I'm not sure this can be trained via self-play. I could
             see issues with trying to bootstrap this from scratch if
             all of the moves are determined by Double Dummy.
+        * After understanding ISMCTS in more detail, NN-assisted
+            determination could definitely be used for ISMCTS and not
+            just PIMC. However, because our results from ISMCTS without
+            NN-assisted determinization was so lackluster, I'm not
+            super eager to try it yet. It'd be interesting to
+            train a REINFORCE only model (no search, no MCTS) for
+            chess and see how it compares to our AlphaZero chess
+            engine.
     - Train model to play good rounds instead of good matches
     - Any of the above already listed but with a bigger net
     - Some type of CFR implementation
