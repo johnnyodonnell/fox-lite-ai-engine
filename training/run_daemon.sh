@@ -17,16 +17,14 @@ export SELFPLAY_PYTHON="$DIR/.venv/bin/python"
 exec python orchestrator.py \
   --out-dir "${OUT_DIR:-runs/run1}" \
   --snapshot-every "${SNAPSHOT_EVERY:-30m}" \
-  --matches "${MATCHES:-2048}" \
+  --matches "${MATCHES:-512}" \
   --selfplay-batch "${SELFPLAY_BATCH:-1024}" \
   --selfplay-threads "${SELFPLAY_THREADS:-16}" \
-  --sgd-batch "${SGD_BATCH:-65536}" \
+  --sgd-batch "${SGD_BATCH:-131072}" \
   --lr "${LR:-1e-3}" \
   --temperature "${TEMPERATURE:-1.0}" \
   --temp-end "${TEMP_END:-0.5}" \
-  --alpha-init "${ALPHA_INIT:-0.05}" \
-  --alpha-lr "${ALPHA_LR:-0.02}" \
-  --ent-target-frac "${ENT_TARGET_FRAC:-0.5}" \
+  --c-entropy "${C_ENTROPY:-0.05}" \
   --eval-games "${EVAL_GAMES:-200}" \
   --n-top "${N_TOP:-2}" \
   --n-anchors "${N_ANCHORS:-3}" \

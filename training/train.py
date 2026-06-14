@@ -5,25 +5,12 @@ On-policy policy gradient with a learned value baseline + entropy bonus:
   policy_loss = -(advantage * log pi(action|state)).mean()      # over legal moves
   value_loss  = MSE(value(state), z)
   entropy     = mean entropy of the (legal-masked) policy
-  loss        = policy_loss + c_value*value_loss - alpha*entropy
+  loss        = policy_loss + c_value*value_loss - c_entropy*entropy
 
-`alpha` (the entropy coefficient) is *adaptive*, not fixed: a SAC-style dual
-variable auto-tuned to hold the measured entropy at a target. The target is a
-fraction of the mean max-entropy log(n_legal), so it auto-scales to how
-constrained positions are (legal-move counts vary widely here). This is what
-keeps the policy from collapsing under the dense, high-magnitude per-round
-reward — a fixed coefficient is an open-loop tug-of-war the reward wins.
-
-  alpha      = exp(log_alpha)
-  H_target   = ent_target_frac * mean(log n_legal)
-  alpha_loss = alpha * (entropy.detach() - H_target)   # GD on log_alpha:
-                                                       # H<target -> alpha up
-
-The cohort is on-policy data from the *current* weights, so we make only a small
-number of passes (epochs) per cohort to avoid drifting off-policy.
+The cohort is on-policy data from the *current* weights. Cohorts are sized so
+each is a single SGD step (rows <= sgd_batch), keeping every update strictly
+on-policy — the gradient is only unbiased for the policy that generated the data.
 """
-
-import math
 
 import numpy as np
 import torch
@@ -33,9 +20,7 @@ MASK_NEG = 1.0e9
 
 
 def train_on_cohort(net, opt, cohort, device, *, sgd_batch=1024, epochs=1,
-                    c_value=1.0, log_alpha=None, alpha_opt=None,
-                    ent_target_frac=0.5, alpha_min=1e-3, alpha_max=0.5,
-                    grad_clip=1.0, rng=None):
+                    c_value=1.0, c_entropy=0.05, grad_clip=1.0, rng=None):
     states = torch.from_numpy(cohort["states"]).to(device)
     masks = torch.from_numpy(cohort["masks"]).to(device)
     actions = torch.from_numpy(cohort["actions"]).to(device)
@@ -43,10 +28,8 @@ def train_on_cohort(net, opt, cohort, device, *, sgd_batch=1024, epochs=1,
     n = cohort["n"]
     if rng is None:
         rng = np.random.default_rng()
-    log_alpha_min, log_alpha_max = math.log(alpha_min), math.log(alpha_max)
 
-    agg = {"loss": 0.0, "policy": 0.0, "value": 0.0, "entropy": 0.0,
-           "alpha": 0.0, "ent_target": 0.0}
+    agg = {"loss": 0.0, "policy": 0.0, "value": 0.0, "entropy": 0.0}
     steps = 0
     net.train()
     for _ in range(epochs):
@@ -63,13 +46,7 @@ def train_on_cohort(net, opt, cohort, device, *, sgd_batch=1024, epochs=1,
             value_loss = F.mse_loss(v, zz)
             p = logp.exp()
             entropy = -(p * logp).sum(dim=1).mean()
-            # Target a fraction of the achievable entropy: log(#legal moves),
-            # averaged over the batch. Forced moves (n_legal=1) contribute 0.
-            n_legal = m.sum(dim=1).clamp_min(1.0)
-            ent_target = ent_target_frac * n_legal.log().mean()
-
-            alpha = log_alpha.exp()
-            loss = policy_loss + c_value * value_loss - alpha.detach() * entropy
+            loss = policy_loss + c_value * value_loss - c_entropy * entropy
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -77,21 +54,10 @@ def train_on_cohort(net, opt, cohort, device, *, sgd_batch=1024, epochs=1,
                 torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
             opt.step()
 
-            # Dual update for the entropy coefficient (independent of the net
-            # update above; `alpha` is detached there, so no graph conflict).
-            alpha_loss = alpha * (entropy.detach() - ent_target.detach())
-            alpha_opt.zero_grad(set_to_none=True)
-            alpha_loss.backward()
-            alpha_opt.step()
-            with torch.no_grad():
-                log_alpha.clamp_(log_alpha_min, log_alpha_max)
-
             agg["loss"] += float(loss.item())
             agg["policy"] += float(policy_loss.item())
             agg["value"] += float(value_loss.item())
             agg["entropy"] += float(entropy.item())
-            agg["alpha"] += float(alpha.item())
-            agg["ent_target"] += float(ent_target.item())
             steps += 1
 
     if steps:

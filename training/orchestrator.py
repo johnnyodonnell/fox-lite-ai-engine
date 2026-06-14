@@ -14,7 +14,6 @@ import argparse
 import datetime
 import glob
 import json
-import math
 import os
 import select
 import subprocess
@@ -125,15 +124,7 @@ def parse_args():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--c-value", type=float, default=1.0)
-    # Adaptive entropy coefficient (SAC-style dual variable): auto-tuned to hold
-    # measured entropy at ent_target_frac * mean(log n_legal). Prevents the policy
-    # collapse the dense per-round reward causes with a fixed coefficient.
-    ap.add_argument("--alpha-init", type=float, default=0.05, help="initial entropy coef")
-    ap.add_argument("--alpha-lr", type=float, default=0.02, help="lr for the entropy-coef dual var")
-    ap.add_argument("--ent-target-frac", type=float, default=0.5,
-                    help="target entropy as a fraction of mean log(n_legal)")
-    ap.add_argument("--alpha-min", type=float, default=1e-3)
-    ap.add_argument("--alpha-max", type=float, default=0.5)
+    ap.add_argument("--c-entropy", type=float, default=0.05, help="fixed entropy bonus coef")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-cohorts", type=int, default=0, help="0 = run forever")
     ap.add_argument("--no-eval", action="store_true")
@@ -159,10 +150,6 @@ def main():
     # FQNs the Rust forward loads (no `_orig_mod.` prefix).
     net_train = torch.compile(net)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    # Adaptive entropy coefficient lives here (persists across cohorts/resume):
-    # log_alpha is the dual variable, alpha_opt drives it toward the entropy target.
-    log_alpha = torch.tensor(math.log(args.alpha_init), device=device, requires_grad=True)
-    alpha_opt = torch.optim.Adam([log_alpha], lr=args.alpha_lr)
     rng = np.random.default_rng(args.seed)
 
     base_elapsed, total_cohorts, total_games, total_steps = 0.0, 0, 0, 0
@@ -172,10 +159,6 @@ def main():
         ckpt = torch.load(latest, map_location=device, weights_only=False)
         net.load_state_dict(ckpt["weights"])
         opt.load_state_dict(ckpt["opt"])
-        if "log_alpha" in ckpt:
-            with torch.no_grad():
-                log_alpha.copy_(ckpt["log_alpha"].to(device))
-            alpha_opt.load_state_dict(ckpt["alpha_opt"])
         base_elapsed = ckpt.get("elapsed_sec", 0.0)
         total_cohorts = ckpt.get("cohorts", 0)
         total_games = ckpt.get("games", 0)
@@ -205,8 +188,6 @@ def main():
         torch.save({
             "weights": net.state_dict(),
             "opt": opt.state_dict(),
-            "log_alpha": log_alpha.detach().cpu(),
-            "alpha_opt": alpha_opt.state_dict(),
             "elapsed_sec": elapsed(),
             "cohorts": total_cohorts,
             "games": total_games,
@@ -283,9 +264,7 @@ def main():
         stats = train_on_cohort(
             net_train, opt, cohort, device,
             sgd_batch=args.sgd_batch, epochs=args.epochs,
-            c_value=args.c_value, log_alpha=log_alpha, alpha_opt=alpha_opt,
-            ent_target_frac=args.ent_target_frac,
-            alpha_min=args.alpha_min, alpha_max=args.alpha_max, rng=rng,
+            c_value=args.c_value, c_entropy=args.c_entropy, rng=rng,
         )
         tr_sec = time.time() - t1
 
@@ -313,8 +292,6 @@ def main():
             "policy": round(stats["policy"], 4),
             "value": round(stats["value"], 4),
             "entropy": round(stats["entropy"], 4),
-            "alpha": round(stats["alpha"], 4),
-            "ent_target": round(stats["ent_target"], 4),
             "next_snap_in": round(next_snapshot_at - elapsed(), 1),
         }), flush=True)
 
