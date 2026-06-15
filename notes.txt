@@ -69,13 +69,18 @@
             to see how some of our earlier runs would have faired
             had we identified this.
         * We also added temperature annealing, which is done on a
-            per-round basis. I thought our earlier runs had had
-            this but apparently not all of them did, and apparently
-            run6 did not have temperature annealing. And we increased
-            c_entropy, which I'm not sure what effect that had, but
-            we increased it because it was the original theory
-            for why our model was collapsing in earlier attempts
-            for the per-round rewarding.
+                per-round basis. I thought our earlier runs had had
+                this but apparently not all of them did, and apparently
+                run6 did not have temperature annealing. And we increased
+                c_entropy, which I'm not sure what effect that had, but
+                we increased it because it was the original theory
+                for why our model was collapsing in earlier attempts
+                for the per-round rewarding.
+            - I reverted c_entropy back to 0.01 after 20 hours of runtime
+                just so that this would be less of a factor. We proved
+                our model was collapsing due to the batch/match size,
+                so reverting this back just helped remove one more
+                unnecessary variable.
     - Include the full hand history as input into the NN model
         * The model takes ~3x as long to train a cohort and therefore
             the self-play/training loop takes about ~2x as long. So to
