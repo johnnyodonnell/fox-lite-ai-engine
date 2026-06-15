@@ -60,7 +60,7 @@
             batch/match size and lowered it to achieve the successful
             results that we are seeing now. Essentially, before
             lowering the match/batch size, 4 gradient steps were
-            running per cohort, which was our model couldn't handle.
+            running per cohort, which our model couldn't handle.
             Because our model is REINFORCE, we need to train it
             on-policy, and training it with 4 gradient steps was
             too much. Lowering the batch/match size lowered the
