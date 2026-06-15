@@ -31,7 +31,6 @@
             train a REINFORCE only model (no search, no MCTS) for
             chess and see how it compares to our AlphaZero chess
             engine.
-    - Train model to play good rounds instead of good matches
     - Any of the above already listed but with a bigger net
     - Some type of CFR implementation
         * This feels a little bit more complext, and something outside
@@ -40,6 +39,43 @@
         * Some of the ideas recommended include DeepCFR and ReBeL
 
 * Successful attempts
+    - Train model to play good rounds instead of good matches
+        * Once we switched our training session to use rounds as
+            rewards instead of matches (run7), we saw a significant
+            increase in strength. In just 3.5hrs of training, our
+            per-round model beat every single one of our best
+            per-match models (run6), up to and including the last
+            model which had trained for 40hrs.
+        * We're using a naive per-round reward system. For any round
+            that's not the final round, the round points determine the
+            model's reward. In the final round, the match outcome
+            determine's the model's reward. So it's pretty naive
+            and doesn't account for taking more risks if you are down
+            0-12 or 0-18, but I didn't want to take the time/effort
+            to add that type of strategy.
+        * We had to decrease the batch/match size because when we
+            first ran this with the batch/match size at the same
+            level that run6 had used, we were getting terrible
+            results. We correctly identified that the issue was
+            batch/match size and lowered it to achieve the successful
+            results that we are seeing now. Essentially, before
+            lowering the match/batch size, 4 gradient steps were
+            running per cohort, which was our model couldn't handle.
+            Because our model is REINFORCE, we need to train it
+            on-policy, and training it with 4 gradient steps was
+            too much. Lowering the batch/match size lowered the
+            gradient steps per cohort to 1 - which is maybe what
+            it always should have been. It would be interesting
+            to see how some of our earlier runs would have faired
+            had we identified this.
+        * We also added temperature annealing, which is done on a
+            per-round basis. I thought our earlier runs had had
+            this but apparently not all of them did, and apparently
+            run6 did not have temperature annealing. And we increased
+            c_entropy, which I'm not sure what effect that had, but
+            we increased it because it was the original theory
+            for why our model was collapsing in earlier attempts
+            for the per-round rewarding.
     - Include the full hand history as input into the NN model
         * The model takes ~3x as long to train a cohort and therefore
             the self-play/training loop takes about ~2x as long. So to
