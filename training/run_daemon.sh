@@ -24,7 +24,7 @@ exec python orchestrator.py \
   --lr "${LR:-1e-3}" \
   --temperature "${TEMPERATURE:-1.0}" \
   --temp-end "${TEMP_END:-0.5}" \
-  --c-entropy "${C_ENTROPY:-0.05}" \
+  --c-entropy "${C_ENTROPY:-0.01}" \
   --eval-games "${EVAL_GAMES:-200}" \
   --n-top "${N_TOP:-2}" \
   --n-anchors "${N_ANCHORS:-3}" \
