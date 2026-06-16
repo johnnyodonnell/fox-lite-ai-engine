@@ -15,8 +15,10 @@
 //! is an exact terminal. SO-ISMCTS: re-determinize the opponent's hidden hand
 //! each simulation; a single tree keyed by the public card-play sequence;
 //! per-determinization availability handled by only ranking currently-legal
-//! actions. Known limit: optimizes per-round point margin (the value head's
-//! training target), not match-win probability.
+//! actions. Determinizations respect revealed voids: a suit the opponent has
+//! failed to follow is never dealt back into their sampled hand. Known limit:
+//! optimizes per-round point margin (the value head's training target), not
+//! match-win probability.
 
 use std::collections::HashMap;
 
@@ -29,7 +31,9 @@ use foxlite_core::encode::{
     encode, encode_v1, encode_v2, legal_mask, real_card_from_canon_index, INPUT_SIZE,
     INPUT_SIZE_V1, INPUT_SIZE_V2,
 };
-use foxlite_core::{sort_hand, score_for_tricks, Card, Phase, Player, State, NUM_CARDS};
+use foxlite_core::{
+    sort_hand, score_for_tricks, Card, Phase, Player, State, NUM_CARDS, NUM_RANKS, NUM_SUITS,
+};
 use selfplay_rs::net::AnyNet;
 
 fn flag(args: &[String], key: &str, default: &str) -> String {
@@ -103,10 +107,35 @@ struct Node {
     edges: HashMap<u8, Edge>, // keyed by canonical card slot 0..33
 }
 
+/// Suits `player` has publicly revealed they hold none of: as a *follower* they
+/// failed to follow the led suit (played off-suit), which is only legal when
+/// void. Leading reveals nothing. `trick_history` is chronological with two
+/// events per completed trick — the lead then the follow.
+fn voided_suits(real: &State, player: Player) -> [bool; NUM_SUITS] {
+    let mut void = [false; NUM_SUITS];
+    let h = &real.trick_history;
+    let mut i = 0;
+    while i < h.len() {
+        let lead = h[i];
+        // Pair the lead with its follow (same trick). A lone trailing event is
+        // the in-progress trick's lead — no void info there.
+        if i + 1 < h.len() && h[i + 1].trick == lead.trick {
+            let follow = h[i + 1];
+            if follow.player == player && follow.card.suit != lead.card.suit {
+                void[lead.card.suit as usize] = true;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    void
+}
+
 /// Sample a world consistent with `mover`'s information set: keep `mover`'s real
 /// hand, trump and the played history; deal the opponent a random hand of the
-/// (public) correct size from the unknown pool. The 6 unused cards fall out as
-/// whatever is left over.
+/// (public) correct size from the unknown pool, EXCLUDING any suit the opponent
+/// has shown a void in. The 6 unused cards fall out as whatever is left over.
 fn determinize(real: &State, mover: Player, rng: &mut StdRng) -> State {
     let opp = mover.other();
     let mut known = [false; NUM_CARDS];
@@ -117,8 +146,12 @@ fn determinize(real: &State, mover: Player, rng: &mut StdRng) -> State {
     for ev in &real.trick_history {
         known[ev.card.index()] = true;
     }
+    let void = voided_suits(real, opp);
+    // Cards the opponent could still hold: unknown to `mover` and not in a suit
+    // the opponent has revealed a void in. Their real hand is a subset of this,
+    // so there are always >= opp_size eligible cards.
     let mut pool: Vec<Card> = (0..NUM_CARDS)
-        .filter(|i| !known[*i])
+        .filter(|i| !known[*i] && !void[*i / NUM_RANKS])
         .map(Card::from_index)
         .collect();
     pool.shuffle(rng);
