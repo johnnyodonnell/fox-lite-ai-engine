@@ -136,6 +136,8 @@
             engine and see how it performs against our AlphaZero/MCTS
             engine, and use that information to determine if we should
             revisit ISMCTS in this project.
+        * Claude brought up a great point that ISMCTS includes
+            determinizations that include voided suits.
     - AWR
         * Did not have much success here
         * This was suggested early in our project, which is why it was tried
