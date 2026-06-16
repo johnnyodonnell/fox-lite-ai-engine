@@ -81,6 +81,13 @@
                 our model was collapsing due to the batch/match size,
                 so reverting this back just helped remove one more
                 unnecessary variable.
+        * This model peaked at 24hr of training for a total of 40hr
+            of training. c_entropy was adjusted down from 0.05 to
+            0.01 about 2 hours before the 24hr snapshot was taken,
+            so this could have been a factor in the peak. But the
+            other training sessions also peaked around this same
+            time with the same c_entropy value, so it's also possible
+            that the c_entropy adjustment was not a factor.
     - Include the full hand history as input into the NN model
         * The model takes ~3x as long to train a cohort and therefore
             the self-play/training loop takes about ~2x as long. So to
