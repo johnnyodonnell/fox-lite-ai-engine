@@ -123,9 +123,16 @@ class FoxNet(nn.Module):
         """x: [B, INPUT_SIZE] -> (policy_logits [B, 33], value [B])."""
         tok = x[:, :HIST].reshape(-1, HIST_TOKENS, TOKEN_FEATS)
         static = x[:, HIST:]
-        lead = tok[:, :, 0].long()
-        follow = tok[:, :, 1].long()
-        led_self = tok[:, :, 2].long()
+        # Clamp the embedding indices to their valid ranges. A no-op for real
+        # encoded inputs (lead/follow are canonical card slots 0..32, led-by-self
+        # is 0/1), but it keeps the embedding gathers in-bounds when the
+        # AOTInductor export autotunes the fused kernel with random inputs —
+        # otherwise a garbage index trips a device-side assert that poisons the
+        # CUDA context and takes down training (the Rust eager path feeds real
+        # encodings, so net.rs needs no equivalent clamp for forward parity).
+        lead = tok[:, :, 0].long().clamp_(0, NUM_CARDS - 1)
+        follow = tok[:, :, 1].long().clamp_(0, NUM_CARDS - 1)
+        led_self = tok[:, :, 2].long().clamp_(0, 1)
         valid = tok[:, :, 3]  # [B, T]
 
         h = (self.hist_lead_embed(lead) + self.hist_follow_embed(follow)
