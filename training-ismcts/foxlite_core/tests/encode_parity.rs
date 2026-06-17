@@ -65,8 +65,8 @@ struct JState {
 struct Case {
     state: JState,
     mover: String,
-    enc: Vec<usize>,
-    mask: Vec<usize>,
+    enc: Vec<(usize, f32)>, // sparse [index, value] pairs (tokens aren't 0/1)
+    mask: Vec<usize>,       // set (nonzero) indices (mask IS 0/1)
 }
 
 #[derive(Deserialize)]
@@ -109,6 +109,14 @@ fn set_indices(v: &[f32]) -> Vec<usize> {
         .collect()
 }
 
+fn sparse(v: &[f32]) -> Vec<(usize, f32)> {
+    v.iter()
+        .enumerate()
+        .filter(|(_, &x)| x != 0.0)
+        .map(|(i, &x)| (i, x))
+        .collect()
+}
+
 #[test]
 fn encoder_matches_js() {
     let path = concat!(
@@ -128,7 +136,7 @@ fn encoder_matches_js() {
     for (i, case) in fx.cases.iter().enumerate() {
         let state = build_state(&case.state);
         let mover = parse_player(&case.mover);
-        let enc = set_indices(&encode(&state, mover));
+        let enc = sparse(&encode(&state, mover));
         assert_eq!(enc, case.enc, "case {i}: encoding mismatch");
         let mask = set_indices(&legal_mask(&state, mover));
         assert_eq!(mask, case.mask, "case {i}: legal mask mismatch");

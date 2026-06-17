@@ -36,7 +36,7 @@ from train import ReplayBuffer, train_step
 HERE = Path(__file__).resolve().parent
 SELFPLAY_BIN = HERE / "selfplay_rs" / "target" / "release" / "selfplay_rs"
 EVAL_BIN = HERE / "selfplay_rs" / "target" / "release" / "evaluate_rs"
-ROW_FLOATS = INPUT_SIZE + NUM_CARDS + 1  # state[230] + pi[33] + z = 264
+ROW_FLOATS = INPUT_SIZE + NUM_CARDS + 1  # state[209] + pi[33] + z = 243
 
 
 def parse_duration(spec: str) -> float:

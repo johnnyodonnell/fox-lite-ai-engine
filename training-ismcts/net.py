@@ -1,20 +1,40 @@
-"""Residual MLP for Fox-Lite (policy + value heads).
+"""Fox-Lite net v3: transformer history encoder over trick tokens +
+learned-query attention readout + residual MLP trunk (policy + value heads).
 
-Input is the ~230-dim canonical encoding (see encode.py / encode.js / encode.rs).
-Pre-activation residual fully-connected blocks (LayerNorm -> GELU -> Linear),
-two heads: policy (33 canonical card logits) and value (scalar in [-1,1] via tanh,
-target = match outcome z in {-1,+1}).
+Input is the flat 209-dim v3 encoding (see encode.py / encode.js / encode.rs):
+12 trick tokens of [lead card index, follow card index, led-by-self, valid]
+(slot 0 = most recent completed trick) followed by a 161-dim static one-hot
+block. `forward` slices the flat row internally so the trainer, cohort format,
+ONNX export, and the Rust pipeline all keep a single [B, 209] input tensor.
+
+History encoder: token = lead-card embedding + follow-card embedding +
+led-by-self embedding + learned positional embedding; N pre-LN self-attention
+blocks (explicit q/k/v/o Linears — no nn.MultiheadAttention, so the
+safetensors keys stay simple FQNs the Rust forward can mirror); additive key
+mask (valid-1)*1e9; final LayerNorm; then a pooled summary: masked MEAN
+(counting) + masked per-dim MAX (ever-happened facts) + N_READOUT learned
+query vectors that softmax-attend over the tokens, all concatenated. No
+key/value projections: with learned constant queries a key projection is
+absorbed into the query, and a value projection into the stem. An empty
+history (no completed tricks yet) pools to a zero vector by construction
+(the summary is gated on any-valid). The pooled vectors are concatenated
+with the static block and fed to the same residual MLP trunk as v1/v2.
 
 State-dict key names are chosen to be loaded directly by the Rust tch forward
-(selfplay_rs/src/net.rs): stem, blocks.{i}.{ln1,fc1,ln2,fc2}, policy_ln/policy_fc,
-value_ln/value_fc1/value_fc2.
+(selfplay_rs/src/net.rs): hist_lead_embed, hist_follow_embed, hist_led_embed,
+hist_pos, hist_layers.{i}.{ln1,q,k,v,o,ln2,fc1,fc2}, hist_ln, readout_q, stem,
+blocks.{i}.{ln1,fc1,ln2,fc2}, policy_ln/policy_fc, value_ln/value_fc1/value_fc2.
 """
+
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from encode import INPUT_SIZE, NUM_CARDS
+from encode import HIST, HIST_TOKENS, INPUT_SIZE, NUM_CARDS, TOKEN_FEATS
+
+STATIC_SIZE = INPUT_SIZE - HIST  # 161
 
 WIDTH = 512
 N_BLOCKS = 4
@@ -26,6 +46,43 @@ VALUE_HIDDEN = 256
 # must run forwards at exactly this batch (enforced at worker startup by
 # aoti_check_batch in the shim). Keep in sync with --batch / Config::batch.
 SERVING_BATCH = 4096
+
+D_MODEL = 128
+N_LAYERS = 2
+N_HEADS = 4
+HEAD_DIM = D_MODEL // N_HEADS  # 32
+FFN = 256
+N_READOUT = 4
+
+MASK_NEG = 1.0e9  # same additive-mask constant as train.py's legal masking
+
+
+class HistLayer(nn.Module):
+    """Pre-LN self-attention block over the history tokens."""
+
+    def __init__(self, d=D_MODEL, ffn=FFN):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d)
+        self.q = nn.Linear(d, d)
+        self.k = nn.Linear(d, d)
+        self.v = nn.Linear(d, d)
+        self.o = nn.Linear(d, d)
+        self.ln2 = nn.LayerNorm(d)
+        self.fc1 = nn.Linear(d, ffn)
+        self.fc2 = nn.Linear(ffn, d)
+
+    def forward(self, x, addmask):
+        """x: [B, T, d]; addmask: [B, 1, 1, T] additive key-padding mask."""
+        h = self.ln1(x)
+        q = self.q(h).reshape(-1, HIST_TOKENS, N_HEADS, HEAD_DIM).transpose(1, 2)
+        k = self.k(h).reshape(-1, HIST_TOKENS, N_HEADS, HEAD_DIM).transpose(1, 2)
+        v = self.v(h).reshape(-1, HIST_TOKENS, N_HEADS, HEAD_DIM).transpose(1, 2)
+        att = q.matmul(k.transpose(-2, -1)) / math.sqrt(HEAD_DIM)  # [B,H,T,T]
+        att = F.softmax(att + addmask, dim=-1)
+        a = att.matmul(v).transpose(1, 2).reshape(-1, HIST_TOKENS, D_MODEL)
+        x = x + self.o(a)
+        x = x + self.fc2(F.gelu(self.fc1(self.ln2(x))))
+        return x
 
 
 class ResBlock(nn.Module):
@@ -43,10 +100,18 @@ class ResBlock(nn.Module):
 
 
 class FoxNet(nn.Module):
-    def __init__(self, input_size=INPUT_SIZE, width=WIDTH, n_blocks=N_BLOCKS,
-                 policy_size=POLICY_SIZE):
+    def __init__(self, width=WIDTH, n_blocks=N_BLOCKS, policy_size=POLICY_SIZE,
+                 d_model=D_MODEL, n_layers=N_LAYERS, n_readout=N_READOUT):
         super().__init__()
-        self.stem = nn.Linear(input_size, width)
+        self.hist_lead_embed = nn.Embedding(NUM_CARDS, d_model)
+        self.hist_follow_embed = nn.Embedding(NUM_CARDS, d_model)
+        self.hist_led_embed = nn.Embedding(2, d_model)
+        self.hist_pos = nn.Parameter(torch.zeros(HIST_TOKENS, d_model))
+        self.hist_layers = nn.ModuleList([HistLayer(d_model) for _ in range(n_layers)])
+        self.hist_ln = nn.LayerNorm(d_model)
+        self.readout_q = nn.Parameter(torch.randn(n_readout, d_model) * 0.02)
+        # mean + max + the query readouts, concatenated
+        self.stem = nn.Linear(STATIC_SIZE + (n_readout + 2) * d_model, width)
         self.blocks = nn.ModuleList([ResBlock(width) for _ in range(n_blocks)])
         self.policy_ln = nn.LayerNorm(width)
         self.policy_fc = nn.Linear(width, policy_size)
@@ -56,11 +121,39 @@ class FoxNet(nn.Module):
 
     def forward(self, x):
         """x: [B, INPUT_SIZE] -> (policy_logits [B, 33], value [B])."""
-        h = self.stem(x)
+        tok = x[:, :HIST].reshape(-1, HIST_TOKENS, TOKEN_FEATS)
+        static = x[:, HIST:]
+        lead = tok[:, :, 0].long()
+        follow = tok[:, :, 1].long()
+        led_self = tok[:, :, 2].long()
+        valid = tok[:, :, 3]  # [B, T]
+
+        h = (self.hist_lead_embed(lead) + self.hist_follow_embed(follow)
+             + self.hist_led_embed(led_self) + self.hist_pos)
+        addmask = ((valid - 1.0) * MASK_NEG).reshape(-1, 1, 1, HIST_TOKENS)
+        for layer in self.hist_layers:
+            h = layer(h, addmask)
+        h = self.hist_ln(h)
+
+        # Attention readout: scores [B,T,Q], softmax over tokens, pooled [B,Q,d].
+        scores = h.matmul(self.readout_q.t()) / math.sqrt(D_MODEL)
+        scores = scores + ((valid - 1.0) * MASK_NEG).unsqueeze(-1)
+        att = F.softmax(scores, dim=1)
+        pooled = att.transpose(1, 2).matmul(h).flatten(1)  # [B, Q*d]
+        vm = valid.unsqueeze(-1)  # [B,T,1]
+        mean = (h * vm).sum(dim=1) / vm.sum(dim=1).clamp(min=1.0)
+        mx = (h + (vm - 1.0) * MASK_NEG).amax(dim=1)
+        pooled = torch.cat([mean, mx, pooled], dim=1)
+        # Empty history: softmax over all-masked slots is uniform over padding
+        # (and the masked max bottoms out at -MASK_NEG), so gate the summary to
+        # an exact zero vector when no token is valid.
+        pooled = pooled * valid.amax(dim=1, keepdim=True)
+
+        t = self.stem(torch.cat([static, pooled], dim=1))
         for block in self.blocks:
-            h = block(h)
-        policy = self.policy_fc(self.policy_ln(h))
-        v = F.gelu(self.value_fc1(self.value_ln(h)))
+            t = block(t)
+        policy = self.policy_fc(self.policy_ln(t))
+        v = F.gelu(self.value_fc1(self.value_ln(t)))
         v = torch.tanh(self.value_fc2(v)).squeeze(-1)
         return policy, v
 

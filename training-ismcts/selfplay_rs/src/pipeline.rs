@@ -56,10 +56,10 @@ use crate::aoti::AotiModel;
 use crate::cuda_event::CudaEvent;
 use crate::net::Net;
 
-pub const ENC_LEN: usize = INPUT_SIZE; // 230
+pub const ENC_LEN: usize = INPUT_SIZE; // 209
 pub const POLICY_SIZE: usize = NUM_CARDS; // 33
 
-/// One finished-game training row: (state[230], pi[33], z).
+/// One finished-game training row: (state[209], pi[33], z).
 pub type Row = (Vec<f32>, [f32; NUM_CARDS], f32);
 
 /// Max points a seat can score in a single round (0-3 or 7-9 tricks => 6). Used
@@ -799,7 +799,7 @@ fn write_f32s<W: Write>(w: &mut W, s: &[f32]) -> io::Result<()> {
     w.write_all(bytes)
 }
 
-/// One finished game = one frame: u32 n_rows, then n_rows x (state[230] f32,
+/// One finished game = one frame: u32 n_rows, then n_rows x (state[209] f32,
 /// pi[33] f32, z f32), little-endian. Flushed per game.
 fn write_frame(out: &Mutex<BufWriter<io::Stdout>>, rows: &[Row]) {
     let mut w = out.lock().unwrap();
