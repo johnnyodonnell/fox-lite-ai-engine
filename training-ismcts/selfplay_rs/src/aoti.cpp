@@ -2,7 +2,7 @@
 // forward), not exposed by tch-rs. Symbols resolve against the torch libs that
 // tch links (LIBTORCH_USE_PYTORCH=1) + the c10_cuda/torch_cuda/cudart that
 // build.rs force-loads. Mirrors chess-ai-engine's shim, adapted to FoxNet's
-// [B, INPUT_SIZE] input and (policy[B,33], value[B]) outputs.
+// [B, INPUT_SIZE] input and (policy[B,33], value[B], belief[B,33]) outputs.
 #include <ATen/Context.h>
 #include <ATen/Functions.h> // at::zeros for the batch-guard probe
 #include <c10/cuda/CUDAStream.h>
@@ -26,12 +26,13 @@ void* aoti_load(const char* path) {
         std::string(path), "model", /*run_single_threaded=*/true));
 }
 
-void aoti_run(void* loader_, const void* in_, void* out_logits_, void* out_values_) {
+void aoti_run(void* loader_, const void* in_, void* out_logits_, void* out_values_, void* out_belief_) {
     auto* loader = reinterpret_cast<torch::inductor::AOTIModelPackageLoader*>(loader_);
     const at::Tensor& in = *reinterpret_cast<const at::Tensor*>(in_);
     std::vector<at::Tensor> outs = loader->run({in});
     reinterpret_cast<at::Tensor*>(const_cast<void*>(out_logits_))->copy_(outs[0]);
     reinterpret_cast<at::Tensor*>(const_cast<void*>(out_values_))->copy_(outs[1]);
+    reinterpret_cast<at::Tensor*>(const_cast<void*>(out_belief_))->copy_(outs[2]);
 }
 
 void aoti_free(void* loader_) {

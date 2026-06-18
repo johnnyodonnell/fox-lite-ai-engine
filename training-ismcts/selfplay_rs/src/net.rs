@@ -110,8 +110,9 @@ impl Net {
         Tensor::embedding(self.g(key), indices, -1, false, false)
     }
 
-    /// (policy_logits [B,33], value [B]) — matches FoxNet.forward.
-    pub fn forward(&self, x: &Tensor) -> (Tensor, Tensor) {
+    /// (policy_logits [B,33], value [B], belief_logits [B,33]) — matches
+    /// FoxNet.forward. `belief` is per-canonical-slot P(opponent holds card) logits.
+    pub fn forward(&self, x: &Tensor) -> (Tensor, Tensor, Tensor) {
         let b = x.size()[0];
         let t = HIST_TOKENS as i64;
         let head_dim = self.d_model / N_HEADS;
@@ -189,7 +190,8 @@ impl Net {
         let v = self.ln(&h, "value_ln", self.width);
         let v = self.linear(&v, "value_fc1").gelu("none");
         let v = self.linear(&v, "value_fc2").tanh().squeeze_dim(-1);
-        (policy, v)
+        let belief = self.linear(&self.ln(&h, "belief_ln", self.width), "belief_fc");
+        (policy, v, belief)
     }
 
     /// Copy fresh weights in place (same keys/shapes); cheap between cohorts.

@@ -55,7 +55,7 @@ fn eval_batch(net: &Net, enc: &[f32], m: usize) -> (Vec<f32>, Vec<f32>) {
     let x = Tensor::from_slice(enc)
         .reshape([m as i64, INPUT_SIZE as i64])
         .to_device(net.device());
-    let (logits, values) = tch::no_grad(|| net.forward(&x));
+    let (logits, values, _belief) = tch::no_grad(|| net.forward(&x));
     let lc = logits.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
     let vc = values.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
     let mut lv = vec![0f32; m * NUM_CARDS];
@@ -129,7 +129,9 @@ where
         let mut path: Vec<usize> = Vec::new();
         for (hi, holder) in holders.iter_mut().enumerate() {
             let searcher = holder.searcher;
-            let mut det = determinize(holder.state, searcher, rng);
+            // Eval uses uniform determinization (belief-guided sampling is a
+            // self-play-only feature for now), keeping this the trusted reference.
+            let mut det = determinize(holder.state, searcher, rng, None);
             let mut boundary = holder.state.clone();
             match walk_to_leaf(&mut holder.arena, 0, &mut det, searcher, &mut path, &mut boundary) {
                 WalkResult::Terminal { v_ref } => {

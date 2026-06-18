@@ -12,7 +12,7 @@ use tch::Tensor;
 
 extern "C" {
     fn aoti_load(path: *const c_char) -> *mut c_void;
-    fn aoti_run(loader: *mut c_void, input: *const c_void, out_logits: *const c_void, out_values: *const c_void);
+    fn aoti_run(loader: *mut c_void, input: *const c_void, out_logits: *const c_void, out_values: *const c_void, out_belief: *const c_void);
     fn aoti_check_batch(loader: *mut c_void, batch: c_long, input_size: c_long) -> i32;
     fn aoti_free(loader: *mut c_void);
     fn aoti_swap_weights(loader: *mut c_void, names: *const *const c_char, tensors: *const *const c_void, n: i32);
@@ -34,14 +34,16 @@ impl AotiModel {
     }
 
     /// Run the fused forward on `input` [B, INPUT_SIZE] bf16 CUDA; write results
-    /// into `out_logits` [B,33] and `out_values` [B] (caller-owned, bf16 CUDA).
-    pub fn run(&self, input: &Tensor, out_logits: &Tensor, out_values: &Tensor) {
+    /// into `out_logits` [B,33], `out_values` [B], and `out_belief` [B,33]
+    /// (caller-owned, bf16 CUDA).
+    pub fn run(&self, input: &Tensor, out_logits: &Tensor, out_values: &Tensor, out_belief: &Tensor) {
         unsafe {
             aoti_run(
                 self.raw,
                 input.as_ptr() as *const c_void,
                 out_logits.as_ptr() as *const c_void,
                 out_values.as_ptr() as *const c_void,
+                out_belief.as_ptr() as *const c_void,
             );
         }
     }

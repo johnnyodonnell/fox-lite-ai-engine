@@ -44,7 +44,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tch::{Device, Kind, Tensor};
 
-use foxlite_core::determinize::determinize_into;
+use foxlite_core::determinize::{determinize_into, opponent_belief_target};
 use foxlite_core::encode::{encode, encode_into, real_card_from_canon_index, INPUT_SIZE};
 use foxlite_core::mcts::{
     add_dirichlet_noise, backprop, expand_node, new_root, sample_move, temperature, visits_to_pi,
@@ -58,9 +58,16 @@ use crate::net::Net;
 
 pub const ENC_LEN: usize = INPUT_SIZE; // 209
 pub const POLICY_SIZE: usize = NUM_CARDS; // 33
+pub const BELIEF_SIZE: usize = NUM_CARDS; // 33 (one belief logit per canonical slot)
 
-/// One finished-game training row: (state[209], pi[33], z).
-pub type Row = (Vec<f32>, [f32; NUM_CARDS], f32);
+/// One finished-game training row: (state[209], pi[33], z, belief_target[33]).
+pub type Row = (Vec<f32>, [f32; NUM_CARDS], f32, [f32; NUM_CARDS]);
+
+/// Logistic sigmoid for converting a belief logit to a sampling weight in (0,1).
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
 
 /// Max points a seat can score in a single round (0-3 or 7-9 tricks => 6). Used
 /// to normalize the per-round reward to roughly [-1, 1] so it shares a scale
@@ -130,6 +137,7 @@ struct LeafCtx {
 }
 struct EvalResult {
     logits: Arc<Vec<f32>>, // whole batch's policy [m * 33]; the worker slices its row
+    belief: Arc<Vec<f32>>, // whole batch's belief logits [m * 33]; sliced like logits
     row: usize,
     value: f32,
 }
@@ -138,6 +146,7 @@ struct EvalResult {
 struct Decision {
     state_enc: Vec<f32>,
     pi: [f32; NUM_CARDS],
+    belief: [f32; NUM_CARDS], // sentinel-encoded opponent-hand belief target
     seat: Player,
 }
 struct InFlight {
@@ -148,6 +157,10 @@ struct InFlight {
     decisions: Vec<Decision>, // current round's decisions, drained at each RoundOver
     rows: Vec<Row>,           // finished rows from already-rewarded (past) rounds
     plies: usize,             // total real moves made so far (priority-queue key)
+    // Per-canonical-slot opponent-hold weights for the CURRENT decision, read from
+    // the root forward's belief head; `None` until the opponent has played a card
+    // this round (before that, unseen cards are exchangeable -> uniform sampling).
+    belief: Option<[f32; NUM_CARDS]>,
     phase: GamePhase,
     pending: Option<EvalResult>,
     leaf_ctx: Option<LeafCtx>,
@@ -175,6 +188,7 @@ fn spawn_fresh(shared: &Shared) -> InFlight {
         decisions: Vec::new(),
         rows: Vec::new(),
         plies: 0,
+        belief: None,
         phase: GamePhase::NeedRootExpand,
         pending: None,
         leaf_ctx: None,
@@ -190,7 +204,7 @@ fn finalize_rows(g: &mut InFlight) -> Vec<Row> {
     let winner = g.state.match_winner().expect("finalize before MatchOver");
     for d in g.decisions.drain(..) {
         let z = if d.seat == winner { 1.0f32 } else { -1.0f32 };
-        g.rows.push((d.state_enc, d.pi, z));
+        g.rows.push((d.state_enc, d.pi, z, d.belief));
     }
     std::mem::take(&mut g.rows)
 }
@@ -207,6 +221,22 @@ fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
             if config.add_root_noise {
                 add_dirichlet_noise(&mut g.arena, 0, &mut g.rng);
             }
+            // Belief-guided determinization for this decision: read the root
+            // forward's belief head into per-slot weights, but only once the
+            // opponent has revealed a card this round (before that the unseen cards
+            // are exchangeable, so the head can't beat uniform — see the plan).
+            let opp = g.searcher.other();
+            let opp_played = g.state.trick_history.iter().any(|ev| ev.player == opp);
+            g.belief = if opp_played {
+                let b = &res.belief[res.row * BELIEF_SIZE..(res.row + 1) * BELIEF_SIZE];
+                let mut w = [0.0f32; NUM_CARDS];
+                for (i, wi) in w.iter_mut().enumerate() {
+                    *wi = sigmoid(b[i]);
+                }
+                Some(w)
+            } else {
+                None
+            };
             g.phase = GamePhase::Simulating(0);
         }
         LeafKind::SimLeaf => {
@@ -237,7 +267,9 @@ fn step_move(g: &mut InFlight) -> bool {
     // overconfidence loop through the PUCT prior term.
     let pi = visits_to_pi(&g.arena, 0, 1.0);
     let state_enc = encode(&g.state, g.searcher);
-    g.decisions.push(Decision { state_enc, pi, seat: g.searcher });
+    // True opponent hand at this decision = the belief head's supervised target.
+    let belief = opponent_belief_target(&g.state, g.searcher);
+    g.decisions.push(Decision { state_enc, pi, belief, seat: g.searcher });
     g.plies += 1;
 
     let mv = sample_move(&g.arena, 0, temp, &mut g.rng);
@@ -256,7 +288,7 @@ fn step_move(g: &mut InFlight) -> bool {
                 if !round_decides_match(&g.state, pts) {
                     let z = round_reward(pts);
                     for d in g.decisions.drain(..) {
-                        g.rows.push((d.state_enc, d.pi, z[d.seat.idx()]));
+                        g.rows.push((d.state_enc, d.pi, z[d.seat.idx()], d.belief));
                     }
                 }
                 let mut rng = std::mem::replace(&mut g.rng, StdRng::seed_from_u64(0));
@@ -302,7 +334,7 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
                     }
                     continue;
                 }
-                determinize_into(&g.state, g.searcher, &mut g.rng, &mut g.det);
+                determinize_into(&g.state, g.searcher, &mut g.rng, &mut g.det, g.belief.as_ref());
                 match walk_to_leaf(&mut g.arena, 0, &mut g.det, g.searcher, &mut g.path, &mut g.leaf_det) {
                     WalkResult::Terminal { v_ref } => {
                         backprop(&mut g.arena, &g.path, v_ref);
@@ -543,6 +575,7 @@ fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
 fn requeue_scattered(
     shared: &Shared,
     logits: Arc<Vec<f32>>,
+    belief: Arc<Vec<f32>>,
     values: &[f32],
     mut games: Vec<Box<InFlight>>,
 ) {
@@ -550,6 +583,7 @@ fn requeue_scattered(
     for (r, g) in games.iter_mut().enumerate() {
         g.pending = Some(EvalResult {
             logits: Arc::clone(&logits),
+            belief: Arc::clone(&belief),
             row: r,
             value: values[r],
         });
@@ -564,6 +598,7 @@ fn requeue_scattered(
 struct WorkItem {
     logits: Tensor, // GPU [m, 33]
     values: Tensor, // GPU [m]
+    belief: Tensor, // GPU [m, 33]
     event: CudaEvent,
     games: Vec<Box<InFlight>>,
 }
@@ -662,15 +697,16 @@ impl Infer {
         self.last_mtime = m;
     }
     /// Launch one async forward over `m` staged encodings; returns the GPU output
-    /// tensors + a completion event (the scatter thread reads them back).
-    fn launch(&self, enc: &[f32], m: usize) -> (Tensor, Tensor, CudaEvent) {
+    /// tensors (logits, values, belief) + a completion event (the scatter thread
+    /// reads them back).
+    fn launch(&self, enc: &[f32], m: usize) -> (Tensor, Tensor, Tensor, CudaEvent) {
         // Narrow to the forward dtype on the CPU side so the H2D copy moves half
         // the bytes (bf16), then ship to the device.
         let x = Tensor::from_slice(enc)
             .reshape([m as i64, ENC_LEN as i64])
             .to_kind(self.kind)
             .to_device(self.dev);
-        let (logits, values) = match &self.backend {
+        let (logits, values, belief) = match &self.backend {
             Backend::Tch(net) => net.forward(&x),
             Backend::Aoti(model) => {
                 // Fresh output tensors per launch (not static buffers), so the scatter
@@ -679,15 +715,17 @@ impl Infer {
                 // (guaranteed: gather() only returns full batches).
                 let out_l = Tensor::zeros([m as i64, POLICY_SIZE as i64], (self.kind, self.dev));
                 let out_v = Tensor::zeros([m as i64], (self.kind, self.dev));
-                model.run(&x, &out_l, &out_v);
-                (out_l, out_v)
+                let out_b = Tensor::zeros([m as i64, BELIEF_SIZE as i64], (self.kind, self.dev));
+                model.run(&x, &out_l, &out_v, &out_b);
+                (out_l, out_v, out_b)
             }
         };
         let logits = logits.to_kind(Kind::Float);
         let values = values.to_kind(Kind::Float);
+        let belief = belief.to_kind(Kind::Float);
         let event = CudaEvent::new();
         event.record();
-        (logits, values, event)
+        (logits, values, belief, event)
     }
 }
 
@@ -710,8 +748,8 @@ fn inference_thread(shared: Arc<Shared>, work_tx: SyncSender<WorkItem>) {
         }
         infer.maybe_reload();
         let m = games.len();
-        let (logits, values, event) = infer.launch(&enc, m);
-        if work_tx.send(WorkItem { logits, values, event, games }).is_err() {
+        let (logits, values, belief, event) = infer.launch(&enc, m);
+        if work_tx.send(WorkItem { logits, values, belief, event, games }).is_err() {
             return; // scatter gone
         }
     }
@@ -723,11 +761,14 @@ fn scatter_thread(shared: Arc<Shared>, work_rx: Receiver<WorkItem>) {
         let m = item.games.len();
         let logits = item.logits.to_device(Device::Cpu).contiguous();
         let values = item.values.to_device(Device::Cpu).contiguous();
+        let belief = item.belief.to_device(Device::Cpu).contiguous();
         let mut lh = vec![0f32; m * POLICY_SIZE];
         logits.copy_data(&mut lh, m * POLICY_SIZE);
         let mut vh = vec![0f32; m];
         values.copy_data(&mut vh, m);
-        requeue_scattered(&shared, Arc::new(lh), &vh, item.games);
+        let mut bh = vec![0f32; m * BELIEF_SIZE];
+        belief.copy_data(&mut bh, m * BELIEF_SIZE);
+        requeue_scattered(&shared, Arc::new(lh), Arc::new(bh), &vh, item.games);
     }
 }
 
@@ -800,14 +841,15 @@ fn write_f32s<W: Write>(w: &mut W, s: &[f32]) -> io::Result<()> {
 }
 
 /// One finished game = one frame: u32 n_rows, then n_rows x (state[209] f32,
-/// pi[33] f32, z f32), little-endian. Flushed per game.
+/// pi[33] f32, z f32, belief[33] f32), little-endian. Flushed per game.
 fn write_frame(out: &Mutex<BufWriter<io::Stdout>>, rows: &[Row]) {
     let mut w = out.lock().unwrap();
     let _ = w.write_all(&(rows.len() as u32).to_le_bytes());
-    for (state, pi, z) in rows {
+    for (state, pi, z, belief) in rows {
         let _ = write_f32s(&mut *w, state);
         let _ = write_f32s(&mut *w, pi);
         let _ = w.write_all(&z.to_le_bytes());
+        let _ = write_f32s(&mut *w, belief);
     }
     let _ = w.flush();
 }

@@ -23,7 +23,14 @@ with the static block and fed to the same residual MLP trunk as v1/v2.
 State-dict key names are chosen to be loaded directly by the Rust tch forward
 (selfplay_rs/src/net.rs): hist_lead_embed, hist_follow_embed, hist_led_embed,
 hist_pos, hist_layers.{i}.{ln1,q,k,v,o,ln2,fc1,fc2}, hist_ln, readout_q, stem,
-blocks.{i}.{ln1,fc1,ln2,fc2}, policy_ln/policy_fc, value_ln/value_fc1/value_fc2.
+blocks.{i}.{ln1,fc1,ln2,fc2}, policy_ln/policy_fc, value_ln/value_fc1/value_fc2,
+belief_ln/belief_fc.
+
+A third head (`belief`) predicts, from the searcher-POV info set, which cards the
+opponent currently holds: [B, 33] logits over canonical card slots, one independent
+Bernoulli per card (sigmoid → P(opponent holds it)). It rides the shared trunk and
+is used only by ISMCTS self-play to bias determinization toward likely opponent
+hands; the browser single-forward path ignores it.
 """
 
 import math
@@ -118,9 +125,12 @@ class FoxNet(nn.Module):
         self.value_ln = nn.LayerNorm(width)
         self.value_fc1 = nn.Linear(width, VALUE_HIDDEN)
         self.value_fc2 = nn.Linear(VALUE_HIDDEN, 1)
+        # Opponent-hand belief head: one logit per canonical card slot.
+        self.belief_ln = nn.LayerNorm(width)
+        self.belief_fc = nn.Linear(width, policy_size)
 
     def forward(self, x):
-        """x: [B, INPUT_SIZE] -> (policy_logits [B, 33], value [B])."""
+        """x: [B, INPUT_SIZE] -> (policy_logits [B,33], value [B], belief_logits [B,33])."""
         tok = x[:, :HIST].reshape(-1, HIST_TOKENS, TOKEN_FEATS)
         static = x[:, HIST:]
         # Clamp the embedding indices to their valid ranges. A no-op for real
@@ -162,7 +172,8 @@ class FoxNet(nn.Module):
         policy = self.policy_fc(self.policy_ln(t))
         v = F.gelu(self.value_fc1(self.value_ln(t)))
         v = torch.tanh(self.value_fc2(v)).squeeze(-1)
-        return policy, v
+        belief = self.belief_fc(self.belief_ln(t))
+        return policy, v, belief
 
 
 def n_params(net) -> int:

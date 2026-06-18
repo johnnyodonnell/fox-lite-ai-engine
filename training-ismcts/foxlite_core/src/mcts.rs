@@ -446,7 +446,9 @@ where
     let mut path: Vec<usize> = Vec::new();
     let mut boundary = root_state.clone();
     for _ in 0..sims {
-        crate::determinize::determinize_into(root_state, searcher, rng, &mut det);
+        // run_search is the reference / eval path — uniform determinization
+        // (belief-guided sampling is wired only into the self-play pipeline).
+        crate::determinize::determinize_into(root_state, searcher, rng, &mut det, None);
         match walk_to_leaf(&mut arena, 0, &mut det, searcher, &mut path, &mut boundary) {
             WalkResult::Eval { mover } => {
                 let leaf = *path.last().unwrap();

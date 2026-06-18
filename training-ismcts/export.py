@@ -26,12 +26,14 @@ def export_onnx(net, path: str, input_size: int = INPUT_SIZE):
     # Batch-2 dummy + dynamic_shapes: the dynamo exporter specializes size-1
     # dims, which bakes static batch reshapes into the attention layers.
     dummy = torch.zeros(2, input_size, dtype=torch.float32)
+    # The net returns three heads (policy, value, belief); the browser single-forward
+    # path only consumes policy+value, but the ONNX must name every output it emits.
     torch.onnx.export(
         ex,
         (dummy,),
         path,
         input_names=["input"],
-        output_names=["policy", "value"],
+        output_names=["policy", "value", "belief"],
         dynamic_shapes=({0: torch.export.Dim("batch")},),
         opset_version=17,
     )

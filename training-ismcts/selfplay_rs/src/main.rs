@@ -12,7 +12,7 @@ use tch::{Device, Kind, Tensor};
 use selfplay_rs::aoti::AotiModel;
 use selfplay_rs::net::Net;
 use selfplay_rs::pipeline;
-use selfplay_rs::pipeline::{ENC_LEN, POLICY_SIZE};
+use selfplay_rs::pipeline::{BELIEF_SIZE, ENC_LEN, POLICY_SIZE};
 
 /// Read a `--key value` flag, falling back to `default`.
 fn flag(args: &[String], key: &str, default: &str) -> String {
@@ -58,17 +58,19 @@ fn forward_check(dir: &str) -> bool {
     let input = fix.get("input").expect("fixture.input");
     let ref_logits = fix.get("ref_logits").expect("fixture.ref_logits");
     let ref_value = fix.get("ref_value").expect("fixture.ref_value");
+    let ref_belief = fix.get("ref_belief").expect("fixture.ref_belief");
     let n = input.size()[0];
 
     // ---- CPU fp32: exact-math gate vs PyTorch CPU fp32 (no TF32 noise) ----
     let net_cpu = Net::load(&wpath, Device::Cpu, Kind::Float);
     let x_cpu = input.to_device(Device::Cpu).to_kind(Kind::Float);
-    let (pl, vl) = net_cpu.forward(&x_cpu);
+    let (pl, vl, bl) = net_cpu.forward(&x_cpu);
     let dl = max_abs_diff(&pl, ref_logits);
     let dv = max_abs_diff(&vl, ref_value);
+    let db = max_abs_diff(&bl, ref_belief);
     println!("forward-check on {n} positions:");
-    println!("  CPU fp32 vs PyTorch: max|Δlogits|={dl:.3e}  max|Δvalue|={dv:.3e}");
-    let cpu_ok = dl < 1e-4 && dv < 1e-4;
+    println!("  CPU fp32 vs PyTorch: max|Δlogits|={dl:.3e}  max|Δvalue|={dv:.3e}  max|Δbelief|={db:.3e}");
+    let cpu_ok = dl < 1e-4 && dv < 1e-4 && db < 1e-4;
 
     // ---- GPU smoke: prove CUDA path runs and is close (fp32 + bf16) ----
     let mut gpu_ok = true;
@@ -76,13 +78,13 @@ fn forward_check(dir: &str) -> bool {
         let dev = Device::Cuda(0);
         let net_g = Net::load(&wpath, dev, Kind::Float);
         let xg = input.to_device(dev).to_kind(Kind::Float);
-        let (plg, vlg) = net_g.forward(&xg);
+        let (plg, vlg, _blg) = net_g.forward(&xg);
         let dlg = max_abs_diff(&plg, ref_logits);
         let dvg = max_abs_diff(&vlg, ref_value);
 
         let net_b = Net::load(&wpath, dev, Kind::BFloat16);
         let xb = input.to_device(dev).to_kind(Kind::BFloat16);
-        let (plb, vlb) = net_b.forward(&xb);
+        let (plb, vlb, _blb) = net_b.forward(&xb);
         let dlb = max_abs_diff(&plb, ref_logits);
         let dvb = max_abs_diff(&vlb, ref_value);
         println!("  GPU fp32 vs PyTorch:  max|Δlogits|={dlg:.3e}  max|Δvalue|={dvg:.3e}");
@@ -116,7 +118,7 @@ fn aoti_check(weights: &str, model: &str, batch: i64) -> bool {
 
     // Eager bf16 reference.
     let net = Net::load(weights, dev, Kind::BFloat16);
-    let (ref_l, ref_v) = net.forward(&x);
+    let (ref_l, ref_v, ref_b) = net.forward(&x);
 
     // Fused AOTI forward via the shim.
     let aoti = AotiModel::load(model);
@@ -129,14 +131,16 @@ fn aoti_check(weights: &str, model: &str, batch: i64) -> bool {
     }
     let out_l = Tensor::zeros([batch, POLICY_SIZE as i64], (Kind::BFloat16, dev));
     let out_v = Tensor::zeros([batch], (Kind::BFloat16, dev));
-    aoti.run(&x, &out_l, &out_v);
+    let out_b = Tensor::zeros([batch, BELIEF_SIZE as i64], (Kind::BFloat16, dev));
+    aoti.run(&x, &out_l, &out_v, &out_b);
 
     let dl = max_abs_diff(&out_l, &ref_l);
     let dv = max_abs_diff(&out_v, &ref_v);
+    let db = max_abs_diff(&out_b, &ref_b);
     println!("aoti-check on batch={batch}:");
-    println!("  AOTI vs eager bf16:  max|Δlogits|={dl:.3e}  max|Δvalue|={dv:.3e}");
+    println!("  AOTI vs eager bf16:  max|Δlogits|={dl:.3e}  max|Δvalue|={dv:.3e}  max|Δbelief|={db:.3e}");
     // Both paths are bf16; only fusion/accumulation order differs. Loose sanity bound.
-    let ok = dl < 2e-1 && dv < 1e-1;
+    let ok = dl < 2e-1 && dv < 1e-1 && db < 2e-1;
     println!("{}", if ok { "AOTI-CHECK OK" } else { "AOTI-CHECK FAILED" });
     ok
 }
@@ -171,14 +175,16 @@ fn aoti_swap_check(model: &str, w2: &str, batch: i64) -> bool {
     let x = Tensor::randn([batch, ENC_LEN as i64], (Kind::Float, dev)).to_kind(Kind::BFloat16);
     let out_l = Tensor::zeros([batch, POLICY_SIZE as i64], (Kind::BFloat16, dev));
     let out_v = Tensor::zeros([batch], (Kind::BFloat16, dev));
-    aoti.run(&x, &out_l, &out_v);
+    let out_b = Tensor::zeros([batch, BELIEF_SIZE as i64], (Kind::BFloat16, dev));
+    aoti.run(&x, &out_l, &out_v, &out_b);
 
-    let (ref_l, ref_v) = Net::load(w2, dev, Kind::BFloat16).forward(&x);
+    let (ref_l, ref_v, ref_b) = Net::load(w2, dev, Kind::BFloat16).forward(&x);
     let dl = max_abs_diff(&out_l, &ref_l);
     let dv = max_abs_diff(&out_v, &ref_v);
+    let db = max_abs_diff(&out_b, &ref_b);
     println!("aoti-swap-check on batch={batch} (swapped in {w2}):");
-    println!("  AOTI(after swap) vs eager bf16(w2):  max|Δlogits|={dl:.3e}  max|Δvalue|={dv:.3e}");
-    let ok = dl < 2e-1 && dv < 1e-1;
+    println!("  AOTI(after swap) vs eager bf16(w2):  max|Δlogits|={dl:.3e}  max|Δvalue|={dv:.3e}  max|Δbelief|={db:.3e}");
+    let ok = dl < 2e-1 && dv < 1e-1 && db < 2e-1;
     println!("{}", if ok { "AOTI-SWAP-CHECK OK" } else { "AOTI-SWAP-CHECK FAILED (stale weights!)" });
     ok
 }

@@ -36,7 +36,7 @@ from train import ReplayBuffer, train_step
 HERE = Path(__file__).resolve().parent
 SELFPLAY_BIN = HERE / "selfplay_rs" / "target" / "release" / "selfplay_rs"
 EVAL_BIN = HERE / "selfplay_rs" / "target" / "release" / "evaluate_rs"
-ROW_FLOATS = INPUT_SIZE + NUM_CARDS + 1  # state[209] + pi[33] + z = 243
+ROW_FLOATS = INPUT_SIZE + NUM_CARDS + 1 + NUM_CARDS  # state[209] + pi[33] + z + belief[33] = 276
 
 
 def parse_duration(spec: str) -> float:
@@ -292,7 +292,8 @@ def main():
             flat = np.frombuffer(payload, dtype="<f4").reshape(n_rows, ROW_FLOATS)
             rows = [(r[:INPUT_SIZE].copy(),
                      r[INPUT_SIZE:INPUT_SIZE + NUM_CARDS].copy(),
-                     float(r[-1])) for r in flat]
+                     float(r[INPUT_SIZE + NUM_CARDS]),
+                     r[INPUT_SIZE + NUM_CARDS + 1:].copy()) for r in flat]
             while not stop.is_set():
                 try:
                     out_queue.put((rows, 1), timeout=0.5)
@@ -385,6 +386,7 @@ def main():
                     "loss": round(float(np.mean([l["loss"] for l in losses])), 4),
                     "policy": round(float(np.mean([l["policy_loss"] for l in losses])), 4),
                     "value": round(float(np.mean([l["value_loss"] for l in losses])), 4),
+                    "belief": round(float(np.mean([l["belief_loss"] for l in losses])), 4),
                     "entropy": round(float(np.mean([l["target_entropy"] for l in losses])), 4),
                 }
             elif not got_any:

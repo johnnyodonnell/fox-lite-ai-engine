@@ -21,16 +21,19 @@ def main() -> int:
     x = fx["input"].astype(np.float32)
     ref_logits = fx["ref_logits"].astype(np.float32)
     ref_value = fx["ref_value"].astype(np.float32)
+    ref_belief = fx["ref_belief"].astype(np.float32)
 
     sess = ort.InferenceSession(str(FIX / "fwd_model.onnx"),
                                 providers=["CPUExecutionProvider"])
-    out = sess.run(["policy", "value"], {"input": x})
-    policy, value = out[0], out[1].reshape(-1)
+    out = sess.run(["policy", "value", "belief"], {"input": x})
+    policy, value, belief = out[0], out[1].reshape(-1), out[2]
 
     dl = float(np.abs(policy - ref_logits).max())
     dv = float(np.abs(value - ref_value).max())
-    print(f"ONNX vs PyTorch on {x.shape[0]} positions: max|Δlogits|={dl:.3e} max|Δvalue|={dv:.3e}")
-    ok = dl < 1e-4 and dv < 1e-4
+    db = float(np.abs(belief - ref_belief).max())
+    print(f"ONNX vs PyTorch on {x.shape[0]} positions: "
+          f"max|Δlogits|={dl:.3e} max|Δvalue|={dv:.3e} max|Δbelief|={db:.3e}")
+    ok = dl < 1e-4 and dv < 1e-4 and db < 1e-4
     print("ONNX-PARITY OK" if ok else "ONNX-PARITY FAILED")
     return 0 if ok else 1
 

@@ -36,7 +36,7 @@ def main(n: int = 512, seed: int = 0):
 
     x = torch.from_numpy(inputs)
     with torch.no_grad():
-        logits, value = net(x)
+        logits, value, belief = net(x)
 
     save_weights_st(net, str(FIX / "fwd_weights.safetensors"))
     save_file(
@@ -44,6 +44,7 @@ def main(n: int = 512, seed: int = 0):
             "input": x.contiguous(),
             "ref_logits": logits.float().contiguous(),
             "ref_value": value.float().contiguous(),
+            "ref_belief": belief.float().contiguous(),
         },
         str(FIX / "fwd_fixture.safetensors"),
     )
