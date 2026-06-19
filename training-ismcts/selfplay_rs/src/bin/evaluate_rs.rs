@@ -50,19 +50,28 @@ fn round1(x: f64) -> f64 {
 // Net evaluation (batched fp32 forward over a stack of encodings)
 // ---------------------------------------------------------------------------
 /// Run `net` over `m` encodings (`enc` is `m * INPUT_SIZE` f32) and return
-/// `(logits[m*NUM_CARDS], values[m])` on the host.
-fn eval_batch(net: &Net, enc: &[f32], m: usize) -> (Vec<f32>, Vec<f32>) {
+/// `(logits[m*NUM_CARDS], values[m], belief[m*NUM_CARDS])` on the host.
+fn eval_batch(net: &Net, enc: &[f32], m: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let x = Tensor::from_slice(enc)
         .reshape([m as i64, INPUT_SIZE as i64])
         .to_device(net.device());
-    let (logits, values, _belief) = tch::no_grad(|| net.forward(&x));
+    let (logits, values, belief) = tch::no_grad(|| net.forward(&x));
     let lc = logits.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
     let vc = values.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
+    let bc = belief.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
     let mut lv = vec![0f32; m * NUM_CARDS];
     lc.copy_data(&mut lv, m * NUM_CARDS);
     let mut vv = vec![0f32; m];
     vc.copy_data(&mut vv, m);
-    (lv, vv)
+    let mut bv = vec![0f32; m * NUM_CARDS];
+    bc.copy_data(&mut bv, m * NUM_CARDS);
+    (lv, vv, bv)
+}
+
+/// Logistic sigmoid: belief logit -> opponent-hold weight in (0,1).
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +86,9 @@ struct Holder<'a> {
     state: &'a State,
     searcher: Player,
     arena: Vec<Node>,
+    // Per-canonical-slot opponent-hold weights for this decision (from the root
+    // forward's belief head, gated on opp having played a card); None = uniform.
+    belief: Option<[f32; NUM_CARDS]>,
 }
 
 /// A non-terminal leaf awaiting the batched net forward for its holder.
@@ -92,12 +104,13 @@ struct EvalLeaf {
 /// Advance every holder's ISMCTS tree by `sims` simulations, batching all leaf
 /// evaluations across holders through `eval_fn` (one net forward per sim step).
 /// `eval_fn(enc, m)` maps `m` stacked encodings (`m * INPUT_SIZE` f32) to
-/// `(logits[m*NUM_CARDS], values[m])`. No root noise (this is evaluation, not
-/// self-play). `rng` drives the per-simulation determinization, consumed in
-/// holder order — so a single-holder run reproduces `mcts::run_search` exactly.
-fn run_simulations<F, R>(holders: &mut [Holder], sims: usize, rng: &mut R, mut eval_fn: F)
+/// `(logits[m*NUM_CARDS], values[m], belief[m*NUM_CARDS])`. No root noise (this is
+/// evaluation, not self-play). `rng` drives the per-simulation determinization,
+/// consumed in holder order. When `use_belief` is false the determinization is
+/// uniform, so a single-holder run reproduces `mcts::run_search` exactly.
+fn run_simulations<F, R>(holders: &mut [Holder], sims: usize, use_belief: bool, rng: &mut R, mut eval_fn: F)
 where
-    F: FnMut(&[f32], usize) -> (Vec<f32>, Vec<f32>),
+    F: FnMut(&[f32], usize) -> (Vec<f32>, Vec<f32>, Vec<f32>),
     R: Rng + ?Sized,
 {
     // Ensure every root is expanded (single batched pass over the true states).
@@ -109,7 +122,7 @@ where
             let e = encode(holders[i].state, holders[i].searcher);
             enc[j * INPUT_SIZE..(j + 1) * INPUT_SIZE].copy_from_slice(&e);
         }
-        let (logits, _values) = eval_fn(&enc, need.len());
+        let (logits, _values, belief) = eval_fn(&enc, need.len());
         for (j, &i) in need.iter().enumerate() {
             let searcher = holders[i].searcher;
             expand_node(
@@ -119,6 +132,22 @@ where
                 &logits[j * NUM_CARDS..(j + 1) * NUM_CARDS],
                 searcher,
             );
+            // Cache belief weights for this decision (gated on the opponent having
+            // played a card this round); mirrors the self-play pipeline's root expand.
+            if use_belief {
+                let opp = searcher.other();
+                let opp_played = holders[i].state.trick_history.iter().any(|ev| ev.player == opp);
+                holders[i].belief = if opp_played {
+                    let b = &belief[j * NUM_CARDS..(j + 1) * NUM_CARDS];
+                    let mut w = [0.0f32; NUM_CARDS];
+                    for (k, wk) in w.iter_mut().enumerate() {
+                        *wk = sigmoid(b[k]);
+                    }
+                    Some(w)
+                } else {
+                    None
+                };
+            }
         }
     }
 
@@ -129,9 +158,10 @@ where
         let mut path: Vec<usize> = Vec::new();
         for (hi, holder) in holders.iter_mut().enumerate() {
             let searcher = holder.searcher;
-            // Eval uses uniform determinization (belief-guided sampling is a
-            // self-play-only feature for now), keeping this the trusted reference.
-            let mut det = determinize(holder.state, searcher, rng, None);
+            // Belief-guided determinization when enabled (weights cached at root
+            // expand); uniform otherwise — which keeps the run_search equivalence.
+            let belief_ref = if use_belief { holder.belief.as_ref() } else { None };
+            let mut det = determinize(holder.state, searcher, rng, belief_ref);
             let mut boundary = holder.state.clone();
             match walk_to_leaf(&mut holder.arena, 0, &mut det, searcher, &mut path, &mut boundary) {
                 WalkResult::Terminal { v_ref } => {
@@ -156,7 +186,7 @@ where
             let e = encode(&lf.det, lf.mover);
             enc[j * INPUT_SIZE..(j + 1) * INPUT_SIZE].copy_from_slice(&e);
         }
-        let (logits, values) = eval_fn(&enc, leaves.len());
+        let (logits, values, _belief) = eval_fn(&enc, leaves.len());
 
         // Scatter: expand each leaf (boundary backprops are value-only) and
         // backprop its value (searcher POV).
@@ -183,8 +213,10 @@ where
 // ---------------------------------------------------------------------------
 enum Agent {
     /// Neural agent: ISMCTS search (`sims` simulations, noise off) from each
-    /// mover's information set, picking the argmax-visit move.
-    Net { net: Net, sims: usize },
+    /// mover's information set, picking the argmax-visit move. `use_belief` turns
+    /// on belief-guided determinization (the net's opponent-hand head); false =
+    /// uniform determinization.
+    Net { net: Net, sims: usize, use_belief: bool },
     Random,
 }
 
@@ -203,14 +235,14 @@ impl Agent {
                     legal[rng.gen_range(0..legal.len())]
                 })
                 .collect(),
-            Agent::Net { net, sims } => {
+            Agent::Net { net, sims, use_belief } => {
                 // Fresh tree per move (no reuse) — simpler and fine for eval volumes.
                 let mut holders: Vec<Holder> = states
                     .iter()
                     .zip(searchers)
-                    .map(|(&s, &searcher)| Holder { state: s, searcher, arena: new_root(searcher) })
+                    .map(|(&s, &searcher)| Holder { state: s, searcher, arena: new_root(searcher), belief: None })
                     .collect();
-                run_simulations(&mut holders, *sims, rng, |enc, m| eval_batch(net, enc, m));
+                run_simulations(&mut holders, *sims, *use_belief, rng, |enc, m| eval_batch(net, enc, m));
                 holders
                     .iter()
                     .map(|h| sample_move(&h.arena, 0, 0.0, rng)) // temperature 0 = argmax visits
@@ -224,7 +256,7 @@ impl Agent {
 /// bias. All games run concurrently; each step batches the net forwards across
 /// every game where the same agent is to move. Returns the candidate's win count
 /// (no draws in Fox Lite).
-fn play_match(cand: &Agent, opp: &Agent, games: usize, rng: &mut StdRng) -> usize {
+fn play_match(cand: &Agent, opp: &Agent, games: usize, rng: &mut StdRng) -> Vec<bool> {
     struct MatchGame {
         state: State,
         cand_is_human: bool, // candidate plays the Human seat in this game
@@ -287,9 +319,10 @@ fn play_match(cand: &Agent, opp: &Agent, games: usize, rng: &mut StdRng) -> usiz
         }
     }
 
+    // Per-game outcomes in game-index order (true = candidate won game `g`).
     gs.iter()
-        .filter(|g| (g.winner == Some(Player::Human)) == g.cand_is_human)
-        .count()
+        .map(|g| (g.winner == Some(Player::Human)) == g.cand_is_human)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -467,24 +500,42 @@ fn main() {
     // a single opponent (--opp-sims, default --sims) and prints the result without
     // touching pool.json. sims=1 degenerates to argmax of the raw policy (one
     // simulation visits the max-prior child), so `--opp-sims 1` is "search off".
+    // --cand-belief / --opp-belief turn on belief-guided determinization per side:
+    // pass the SAME snapshot as --candidate and --vs with one side's belief flag to
+    // measure belief-guided vs uniform ISMCTS for a single net.
     let vs = flag(&args, "--vs", "");
     if !vs.is_empty() {
         let opp_sims: usize = flag(&args, "--opp-sims", &sims.to_string()).parse().unwrap();
+        let cand_belief = args.iter().any(|a| a == "--cand-belief");
+        let opp_belief = args.iter().any(|a| a == "--opp-belief");
         let mut rng = StdRng::seed_from_u64(seed);
         let cand_name = snapshot_stem(&candidate);
         let cand = Agent::Net {
             net: Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float),
             sims,
+            use_belief: cand_belief,
         };
         let opp_agent = if vs == RANDOM {
             Agent::Random
         } else {
-            Agent::Net { net: Net::load(&vs, dev, Kind::Float), sims: opp_sims }
+            Agent::Net { net: Net::load(&vs, dev, Kind::Float), sims: opp_sims, use_belief: opp_belief }
         };
-        let wins = play_match(&cand, &opp_agent, games, &mut rng);
+        let results = play_match(&cand, &opp_agent, games, &mut rng);
+        let wins = results.iter().filter(|&&w| w).count();
+        let bstr = |b: bool| if b { "belief" } else { "uniform" };
+        // Cumulative candidate win-rate at fixed game-index checkpoints (the run
+        // is deterministic in `seed`, so these bucket one fixed 200-game sequence).
+        for &c in &[10usize, 20, 50, 100, 150, 200] {
+            if c <= games {
+                let w = results[..c].iter().filter(|&&x| x).count();
+                println!("[ab]   after {c:>3} games: {w}/{c} ({:.1}%)", 100.0 * w as f64 / c as f64);
+            }
+        }
         println!(
-            "[ab] {cand_name} (sims={sims}) vs {} (sims={opp_sims}): {wins}/{games} ({:.1}%)",
+            "[ab] {cand_name} (sims={sims} {}) vs {} (sims={opp_sims} {}): {wins}/{games} ({:.1}%)",
+            bstr(cand_belief),
             snapshot_stem(Path::new(&vs)),
+            bstr(opp_belief),
             100.0 * wins as f64 / games.max(1) as f64
         );
         return;
@@ -523,9 +574,13 @@ fn main() {
     }
     println!("[eval] opponents={opponents:?}");
 
+    // The pooled per-snapshot eval stays on uniform determinization so pool.json's
+    // Bradley-Terry fit stays internally consistent (mixing belief/uniform games in
+    // one pool would bias it). Belief-vs-uniform is measured via the --vs A/B mode.
     let cand = Agent::Net {
         net: Net::load(candidate.to_str().expect("utf8 path"), dev, Kind::Float),
         sims,
+        use_belief: false,
     };
 
     // Resolve each opponent's safetensors path up front so the match loop can
@@ -549,9 +604,10 @@ fn main() {
             Some(p) => Agent::Net {
                 net: Net::load(run_dir.join(p).to_str().expect("utf8 path"), dev, Kind::Float),
                 sims,
+                use_belief: false,
             },
         };
-        let wins = play_match(&cand, &opp_agent, games, &mut rng);
+        let wins = play_match(&cand, &opp_agent, games, &mut rng).iter().filter(|&&w| w).count();
         pool.results.push(MatchResult {
             a: cand_name.clone(),
             b: opp.clone(),
@@ -662,17 +718,19 @@ mod tests {
             });
 
             // Batched: one holder, same surrogate applied per row of the batch.
+            // use_belief=false → uniform determinization, matching run_search.
             let mut rng_b = StdRng::seed_from_u64(seed ^ 0xABCD);
-            let mut holders = vec![Holder { state: &s, searcher, arena: new_root(searcher) }];
-            run_simulations(&mut holders, sims, &mut rng_b, |enc, m| {
+            let mut holders = vec![Holder { state: &s, searcher, arena: new_root(searcher), belief: None }];
+            run_simulations(&mut holders, sims, false, &mut rng_b, |enc, m| {
                 let mut lo = vec![0f32; m * NUM_CARDS];
                 let mut vo = vec![0f32; m];
+                let bo = vec![0f32; m * NUM_CARDS];
                 for r in 0..m {
                     let (l, v) = dummy_from_enc(&enc[r * INPUT_SIZE..(r + 1) * INPUT_SIZE]);
                     lo[r * NUM_CARDS..(r + 1) * NUM_CARDS].copy_from_slice(&l);
                     vo[r] = v;
                 }
-                (lo, vo)
+                (lo, vo, bo)
             });
 
             assert_eq!(
