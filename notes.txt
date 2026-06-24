@@ -3,6 +3,10 @@
     - Train with different model architectures (e.g. NFSP) and see
         if we can outperform our current model
     - NN-assisted determination but using PIMC instead of ISMCTS
+        * Only reason I have steered away from PIMC is because it
+            feels much less human when you play against it. In
+            some of our early attempts, we had PIMC solve the last
+            ~5-6 tricks and it was impossible for me to beat.
     - Any of the current approaches but with a bigger net
     - Some type of CFR implementation
         * This feels a little bit more complext, and something outside
